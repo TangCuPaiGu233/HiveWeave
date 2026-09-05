@@ -353,3 +353,66 @@ def validate_transfer(
             )
 
     return None
+
+
+def qa_depth_advisory(
+    *,
+    agents: list[dict[str, Any]],
+    tasks: list[dict[str, Any]] | None,
+) -> str | None:
+    """Milestone-VERIFY creation hint when independent leaf-QA depth is thin.
+
+    45 轮 C 案③（42 轮 P7 实证：VERIFY 单点 QA + 串行锁 → 停摆 4.4h，
+    恢复只剩补招一条）。在 milestoneVerify 创建回执里软引导：独立叶子
+    QA（fam=qa）为 0、或多 VERIFY 排队只有 1 QA 时提示扩编。fail-open，
+    不阻断创建；qa_lead 是 coordinator 家族（policy.py:289），天然不计入
+    叶子 QA 数。
+    """
+    if tasks is None:
+        return None
+    try:
+        from hiveweave.services.policy import infer_role_family
+
+        qa_n = len([
+            a
+            for a in (agents or [])
+            if (a.get("status") or "active") == "active"
+            and infer_role_family(a) == "qa"
+        ])
+    except Exception:
+        return None
+    is_verify = None
+    try:
+        from hiveweave.services.tasks.verify import is_verify_title as _ivt
+
+        is_verify = _ivt
+    except Exception:
+        return None
+    open_verify = 0
+    for t in tasks or []:
+        if t.get("is_archived"):
+            continue
+        if str(t.get("status") or "").strip().lower() in (
+            "closed",
+            "cancelled",
+        ):
+            continue
+        try:
+            if is_verify(t.get("title")):
+                open_verify += 1
+        except Exception:
+            pass
+    if qa_n == 0:
+        return (
+            " QA depth note: no active leaf QA (role family qa) in this "
+            "project — only the QA lead. VERIFY runs serially on MAIN; "
+            "several milestones in flight will queue on one verifier. "
+            "Consider asking HR to hire a leaf test_engineer QA."
+        )
+    if qa_n == 1 and open_verify >= 2:
+        return (
+            f" QA depth note: {open_verify} open VERIFY tasks but only 1 "
+            "leaf QA — the VERIFY serial lock means they queue. Consider "
+            "hiring another test_engineer QA for depth."
+        )
+    return None

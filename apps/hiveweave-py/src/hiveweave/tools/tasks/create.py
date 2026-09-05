@@ -356,9 +356,20 @@ async def create_task_tool(
             " hint: acceptance_criteria is empty — reviewers will have no "
             "per-item DoD to check against (free-text review only)."
         )
+        # 45 轮 C 案③：里程碑 VERIFY 创建时的 QA 深度提示（软引导，不阻断）
+        qa_note = ""
+        if params.milestone_verify:
+            try:
+                from hiveweave.services.org_invariants import qa_depth_advisory
+
+                _agents = await OrgService().list_agents(project_id)
+                _tasks = await ts.list_tasks(project_id)
+                qa_note = qa_depth_advisory(agents=_agents, tasks=_tasks) or ""
+            except Exception as qa_err:  # noqa: BLE001 — fail-open
+                log.debug("qa_depth_advisory_failed", error=str(qa_err))
         return ToolResult.ok(
             f"Task created (id={task_id}, {note}): {title}"
-            f"{force_note}{deps_note}{dod_hint}",
+            f"{force_note}{deps_note}{dod_hint}{qa_note}",
             task_id=task_id,
             status=st,
         )

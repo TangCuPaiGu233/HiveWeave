@@ -293,3 +293,46 @@ def test_span_advisory_transfer_exclude_keeps_count_stable():
         )
         is not None
     )
+
+
+# ── 45 轮 C 案③：里程碑 VERIFY 创建时的 QA 深度提示 ────────────────
+
+
+def test_qa_depth_advisory_no_leaf_qa():
+    from hiveweave.services.org_invariants import qa_depth_advisory
+
+    agents = [
+        {"id": "ceo", "status": "active", "role": "ceo"},
+        {"id": "lead", "status": "active", "role": "qa_lead"},
+    ]
+    tasks = [{"title": "VERIFY: m1", "status": "created"}]
+    note = qa_depth_advisory(agents=agents, tasks=tasks)
+    assert note is not None
+    assert "no active leaf QA" in note
+
+
+def test_qa_depth_advisory_single_qa_multiple_verifies():
+    from hiveweave.services.org_invariants import qa_depth_advisory
+
+    agents = [
+        {"id": "q1", "status": "active", "role": "test_engineer"},
+    ]
+    tasks = [
+        {"title": "VERIFY: m1", "status": "created"},
+        {"title": "VERIFY: m2", "status": "running"},
+    ]
+    note = qa_depth_advisory(agents=agents, tasks=tasks)
+    assert note is not None
+    assert "only 1" in note
+
+
+def test_qa_depth_advisory_sufficient_depth_none():
+    from hiveweave.services.org_invariants import qa_depth_advisory
+
+    agents = [
+        {"id": "q1", "status": "active", "role": "test_engineer"},
+        {"id": "q2", "status": "active", "role": "test_engineer"},
+    ]
+    tasks = [{"title": "VERIFY: m1", "status": "created"}]
+    assert qa_depth_advisory(agents=agents, tasks=tasks) is None
+    assert qa_depth_advisory(agents=agents, tasks=None) is None

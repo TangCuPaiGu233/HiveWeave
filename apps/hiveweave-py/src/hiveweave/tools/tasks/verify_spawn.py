@@ -1127,7 +1127,10 @@ async def maybe_reassign_stalled_verify(
     inbox = InboxService()
 
     if not qa or str(qa) in exclude:
-        # No other independent QA — do not invent a hire; tell coordinator.
+        # No other independent QA — 42 轮 P7 / 45 轮 C 案：恢复路径不再只有
+        # 「补招/人工改派」一条。第 2 次及以后的 stall 通知，自动预授权
+        # qa_lead 代验（隔离规则内：不在排除集、能力匹配）；qa_lead 不可用
+        # 或能力不匹配 → 自动建 qa_engineer 招聘需求兜底；都不行才退回纯通知。
         dest = coordinator or creator
         if not dest:
             log.info(
@@ -1136,6 +1139,171 @@ async def maybe_reassign_stalled_verify(
                 task_id=tid,
             )
             return False
+
+        lead: dict | None = None
+        try:
+            from hiveweave.services.org import OrgService
+
+            _lead = await OrgService().get_agent_by_role(project_id, "qa_lead")
+            if _lead and _lead.get("id"):
+                lead = _lead
+        except Exception as e:
+            log.debug("verify_exec_stall_qa_lead_lookup_failed", error=str(e))
+
+        lead_caps_ok = False
+        if lead and str(lead.get("id") or "") in exclude:
+            # qa_lead 曾实施/合并该任务 → 隔离规则排除，不可代验
+            lead = None
+        if lead and (lead.get("status") or "active") != "active":
+            lead = None
+
+        if lead:
+            from hiveweave.services.policy import (
+                Capability,
+                has_capability,
+            )
+
+            cap_list = [
+                str(c) for c in (req_caps if isinstance(req_caps, list) else [])
+                if str(c)
+            ]
+            lead_caps_ok = not cap_list or all(
+                has_capability(lead, Capability(c)) for c in cap_list
+            )
+
+        # 「第 2 次通知」判定：该收件人此前已收过 ≥1 条 STALL 通知
+        prior_notices = await _count_prior_stall_notices(
+            project_id, tid, dest
+        )
+        lead_id = (
+            str(lead["id"]) if (lead and lead_caps_ok and prior_notices >= 1)
+            else None
+        )
+
+        if lead_id:
+            try:
+                await ts.reassign_task(
+                    project_id,
+                    tid,
+                    new_assignee_id=lead_id,
+                    reassigned_by="system",
+                    reason="verify_executor_stall_qa_lead_proxy",
+                )
+            except Exception as e:
+                log.warning(
+                    "verify_exec_stall_proxy_reassign_failed",
+                    project_id=project_id,
+                    task_id=tid,
+                    qa_lead=lead_id[:12],
+                    error=str(e),
+                )
+                lead_id = None
+
+        if lead_id:
+            leaders = []
+            for rid in (dest, _pick_ceo_id(by_id)):
+                if rid and rid not in leaders and rid != lead_id:
+                    leaders.append(rid)
+            for rid in leaders:
+                try:
+                    await _send_stall_notice(
+                        inbox,
+                        project_id=project_id,
+                        task_id=tid,
+                        to_agent_id=rid,
+                        message=(
+                            f"[VERIFY EXECUTOR STALL] VERIFY '{title}' "
+                            f"({tid[:8]}) stuck in {status}. No other "
+                            f"independent QA available — platform "
+                            f"pre-authorized QA lead ({lead_id[:12]}) to "
+                            f"take over verification (proxy, within "
+                            f"isolation rules). Serial lock stays until "
+                            f"closed/cancelled — not auto-approved."
+                        ),
+                        agents_by_id=by_id,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "verify_exec_stall_proxy_leader_notify_failed",
+                        task_id=tid,
+                        to=rid[:12] if rid else rid,
+                        error=str(e),
+                    )
+            # lead 直达信独立 try（审计 L1）：改派已生效，指派上下文不能
+            # 被 leader 通知的失败连累丢掉
+            try:
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=lead_id,
+                    message=(
+                        f"[VERIFY EXECUTOR STALL] You are now the assignee "
+                        f"of VERIFY '{title}' (taskId={tid}, "
+                        f"status={status}) — platform pre-authorized you as "
+                        f"proxy verifier (previous assignee stalled, no "
+                        f"other independent QA). Continue verification on "
+                        f"MAIN, then submit_task."
+                    ),
+                    message_type="task",
+                    priority="urgent",
+                    task_id=tid,
+                    wake=True,
+                )
+            except Exception as e:
+                log.warning(
+                    "verify_exec_stall_proxy_notify_failed",
+                    task_id=tid,
+                    error=str(e),
+                )
+            try:
+                from hiveweave.agents.trigger import trigger_subordinate
+
+                await trigger_subordinate(lead_id)
+            except Exception as e:
+                log.warning(
+                    "verify_exec_stall_proxy_wake_failed",
+                    task_id=tid,
+                    error=str(e),
+                )
+            log.info(
+                "verify_exec_stall_qa_lead_proxy",
+                project_id=project_id,
+                task_id=tid,
+                qa_lead=lead_id[:12],
+                prior_notices=prior_notices,
+            )
+            return True
+
+        # 兜底：qa_lead 不可用/能力不匹配/首次通知 → 自动建招聘需求 + 纯通知
+        demand_created = False
+        try:
+            from hiveweave.services.staffing import StaffingDemandService
+
+            sds = StaffingDemandService()
+            # 去重（审计 M1）：僵死 VERIFY 每 15min 升级一轮，同 task 的
+            # open 需求已存在就不重建，防 demand 刷屏
+            open_same = [
+                d
+                for d in await sds.get_open_demands(project_id, "qa_engineer")
+                if str(d.get("task_id") or "") == tid
+            ]
+            if open_same:
+                demand_created = True
+            else:
+                demand_id = await sds.create_demand(
+                    project_id=project_id,
+                    role_needed="qa_engineer",
+                    reason=(
+                        f"VERIFY {tid[:8]} executor stall, no alternative QA "
+                        f"(qa_lead unavailable or caps mismatch)"
+                    ),
+                    task_id=tid,
+                    priority="high",
+                )
+                demand_created = bool(demand_id)
+        except Exception as e:
+            log.warning(
+                "verify_exec_stall_demand_create_failed", error=str(e)
+            )
         try:
             await _send_stall_notice(
                 inbox,
@@ -1148,7 +1316,12 @@ async def maybe_reassign_stalled_verify(
                     f"No other independent QA (≠ implementer, ≠ current "
                     f"assignee, ≠ merger). Serial lock still held until this "
                     f"VERIFY is closed/cancelled — do not auto-approve. "
-                    f"Hire or reassign a QA if needed."
+                    + (
+                        "Platform auto-created a qa_engineer staffing "
+                        "demand; HR hire will unblock future VERIFY depth."
+                        if demand_created
+                        else "Hire or reassign a QA if needed."
+                    )
                 ),
                 agents_by_id=by_id,
             )
@@ -1164,6 +1337,7 @@ async def maybe_reassign_stalled_verify(
             project_id=project_id,
             task_id=tid,
             notified=dest,
+            demand_created=demand_created,
         )
         return True
 

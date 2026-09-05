@@ -482,3 +482,160 @@ async def test_nudge_stale_ledger_verify_escalation_calls_reassign():
         (m.get("message") or "").startswith("[TASK STALL ESCALATION]")
         for m in sent
     )
+
+
+# ── 45 轮 C 案：无替补 QA 时第 2 次通知自动预授权 qa_lead 代验 ──────
+
+LEAD = "qa-lead-1"
+
+
+def _lead_agent() -> dict:
+    return {
+        "id": LEAD,
+        "role": "qa_lead",
+        "status": "active",
+        "parent_id": None,
+        "name": "lead",
+        "short_id": "L1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_stall_no_qa_second_notice_preauthorizes_qa_lead(task_env):
+    ts = TaskService()
+    pid = task_env["project_id"]
+    verify_id = await _make_verify(pid, ts, title="UI stall proxy")
+    await ts.claim_task(pid, verify_id, EXEC)
+    task = await ts.get_task(pid, verify_id)
+
+    send = AsyncMock()
+    trigger = AsyncMock()
+    reassign = AsyncMock()
+    by_id = {
+        EXEC: {"id": EXEC, "parent_id": COORD, "name": "exec", "short_id": "E1"},
+        COORD: {"id": COORD, "parent_id": None, "name": "coord", "short_id": "C1"},
+    }
+    with (
+        patch(
+            "hiveweave.tools.tasks.verify_spawn._find_independent_qa",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "hiveweave.tools.tasks.verify_spawn._count_prior_stall_notices",
+            new=AsyncMock(return_value=1),  # 这是第 2 次通知
+        ),
+        patch(
+            "hiveweave.services.org.OrgService.get_agent_by_role",
+            new=AsyncMock(return_value=_lead_agent()),
+        ),
+        patch(
+            "hiveweave.services.task.TaskService.reassign_task",
+            reassign,
+        ),
+        patch("hiveweave.services.inbox.InboxService.send_message", send),
+        patch("hiveweave.agents.trigger.trigger_subordinate", trigger),
+    ):
+        handled = await maybe_reassign_stalled_verify(
+            pid, task, agents_by_id=by_id
+        )
+
+    assert handled is True
+    reassign.assert_awaited_once()
+    kw = reassign.await_args.kwargs
+    assert kw.get("new_assignee_id") == LEAD
+    assert kw.get("reason") == "verify_executor_stall_qa_lead_proxy"
+    trigger.assert_awaited_with(LEAD)
+    bodies = [str(c.kwargs.get("message") or "") for c in send.await_args_list]
+    assert any("pre-authorized QA lead" in b for b in bodies)
+    targets = [c.kwargs.get("to_agent_id") for c in send.await_args_list]
+    assert LEAD in targets
+
+
+@pytest.mark.asyncio
+async def test_stall_no_qa_first_notice_no_proxy(task_env):
+    """首次通知不代验——维持纯通知（预授权只在第 2 次及以后）。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    verify_id = await _make_verify(pid, ts, title="UI stall first")
+    await ts.claim_task(pid, verify_id, EXEC)
+    task = await ts.get_task(pid, verify_id)
+
+    send = AsyncMock()
+    reassign = AsyncMock()
+    by_id = {
+        EXEC: {"id": EXEC, "parent_id": COORD, "name": "exec", "short_id": "E1"},
+        COORD: {"id": COORD, "parent_id": None, "name": "coord", "short_id": "C1"},
+    }
+    with (
+        patch(
+            "hiveweave.tools.tasks.verify_spawn._find_independent_qa",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "hiveweave.tools.tasks.verify_spawn._count_prior_stall_notices",
+            new=AsyncMock(return_value=0),
+        ),
+        patch(
+            "hiveweave.services.org.OrgService.get_agent_by_role",
+            new=AsyncMock(return_value=_lead_agent()),
+        ),
+        patch(
+            "hiveweave.services.task.TaskService.reassign_task",
+            reassign,
+        ),
+        patch("hiveweave.services.inbox.InboxService.send_message", send),
+    ):
+        handled = await maybe_reassign_stalled_verify(
+            pid, task, agents_by_id=by_id
+        )
+
+    assert handled is True
+    reassign.assert_not_awaited()
+    assert send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stall_qa_lead_excluded_falls_back_to_demand(task_env):
+    """qa_lead 在排除集（曾实施/合并）→ 不代验，自动建 qa_engineer 需求。"""
+    ts = TaskService()
+    pid = task_env["project_id"]
+    verify_id = await _make_verify(pid, ts, title="UI stall demand")
+    await ts.claim_task(pid, verify_id, EXEC)
+    task = await ts.get_task(pid, verify_id)
+    # qa_lead 曾合并该任务 → merged_by 进排除集
+    task["evidence"] = {"merged_by": LEAD}
+
+    send = AsyncMock()
+    demand = AsyncMock(return_value="demand-1")
+    by_id = {
+        EXEC: {"id": EXEC, "parent_id": COORD, "name": "exec", "short_id": "E1"},
+        COORD: {"id": COORD, "parent_id": None, "name": "coord", "short_id": "C1"},
+    }
+    with (
+        patch(
+            "hiveweave.tools.tasks.verify_spawn._find_independent_qa",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "hiveweave.tools.tasks.verify_spawn._count_prior_stall_notices",
+            new=AsyncMock(return_value=2),
+        ),
+        patch(
+            "hiveweave.services.org.OrgService.get_agent_by_role",
+            new=AsyncMock(return_value=_lead_agent()),
+        ),
+        patch(
+            "hiveweave.services.staffing.StaffingDemandService.create_demand",
+            demand,
+        ),
+        patch("hiveweave.services.inbox.InboxService.send_message", send),
+    ):
+        handled = await maybe_reassign_stalled_verify(
+            pid, task, agents_by_id=by_id
+        )
+
+    assert handled is True
+    demand.assert_awaited_once()
+    assert demand.await_args.kwargs.get("role_needed") == "qa_engineer"
+    bodies = [str(c.kwargs.get("message") or "") for c in send.await_args_list]
+    assert any("staffing demand" in b for b in bodies)

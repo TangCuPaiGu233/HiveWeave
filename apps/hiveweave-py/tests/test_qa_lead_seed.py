@@ -83,3 +83,19 @@ def test_qa_lead_prompt_block_injected_for_qa_role_only():
         permission_type="coordinator", name="某架构", goal="", backstory="",
     )
     assert QA_LEAD_BLOCK not in other
+
+
+def test_qa_lead_block_calibration_markers():
+    """45 轮验真剧本校准：六轮实战的七处补句必须都在。"""
+    from hiveweave.prompts.qa_lead import QA_LEAD_BLOCK
+
+    for marker in (
+        "approve 仅用于判定通过并放行",      # a1 verdict 语义（41 轮 37 次改判）
+        "文件级主张现场复验",                # a2 假 FAIL 防线（42 轮 P0-2）
+        "不要在 QA 间来回改派",              # a3 停摆处置（40 轮踢皮球 3.8h）
+        "不要\n  绕行",                      # a4 门禁拒绝纪律（40 轮绕行）
+        "没有 .md 手写通道",                 # a5 证据归档正路（45 轮 #7）
+        "三组负样本自检冒烟门",              # a6 负样本演练固化（39 轮）
+        "验收方式选型",                      # a7 test_run 优先（41 轮 L9 相乘）
+    ):
+        assert marker in QA_LEAD_BLOCK, marker

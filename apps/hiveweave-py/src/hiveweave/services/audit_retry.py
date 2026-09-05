@@ -412,7 +412,11 @@ class AuditRetryLoop:
             return 0
         processed = 0
         for p in rows or []:
-            pid = str((p or {}).get("id") or "")
+            # meta 库行是 sqlite3.Row（无 .get）；Row 与 dict 都支持 ["id"]。
+            try:
+                pid = str(p["id"] or "")
+            except Exception:  # noqa: BLE001
+                continue
             if not pid:
                 continue
             try:

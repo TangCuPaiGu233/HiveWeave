@@ -1376,3 +1376,43 @@ async def test_idempotent_reject_wording_quality(env):
     text = (second.output or "") + (second.error or "")
     assert "kind=quality" in text
     assert "quality-class waived_by cannot approve" in text
+
+
+@pytest.mark.asyncio
+async def test_scan_once_tolerates_row_typed_meta_rows(env):
+    """scan_once 对 meta 库 sqlite3.Row 行不再 .get 崩溃（TEST_BATCH_43 活体回归）。
+
+    活体项目每 68s 报 audit_retry_loop_error: 'sqlite3.Row' object has no
+    attribute 'get' —— scan_once 此前对 meta 行做 (p or {}).get("id")，
+    Row 无 .get → 整轮扫描抛异常，重试队列永不工作。
+    """
+    import sqlite3 as _sq
+
+    from hiveweave.services.audit_retry import AuditRetryLoop
+
+    mem = _sq.connect(":memory:")
+    mem.row_factory = _sq.Row
+    mem.execute("CREATE TABLE projects (id TEXT)")
+    mem.execute("INSERT INTO projects VALUES (?)", (PROJECT_ID,))
+    row = mem.execute("SELECT id FROM projects").fetchone()
+    assert isinstance(row, _sq.Row)
+
+    with (
+        patch(
+            "hiveweave.services.audit_retry.meta_db.query",
+            new_callable=AsyncMock,
+            return_value=[row],
+        ),
+        patch.object(
+            AuditRetryLoop,
+            "_scan_project",
+            new_callable=AsyncMock,
+            return_value=0,
+        ) as sp,
+    ):
+        loop = AuditRetryLoop()
+        processed = await loop.scan_once()
+
+    assert sp.await_count == 1
+    assert sp.await_args.args[0] == PROJECT_ID
+    assert processed == 0

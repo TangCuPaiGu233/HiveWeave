@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MessageBubble } from "./MessageBubble";
 import type { ChatMessage, MsgSegment } from "./types";
 
@@ -208,5 +208,167 @@ describe("MessageBubble text 段 P1 审计收尾", () => {
     // markdown 会渲染出 h1/strong —— 纯文本降级后全部保持字面
     expect(container.querySelector("h1, strong, pre, code")).toBeNull();
     expect(container.textContent).toContain("# 大标题 **加粗**");
+  });
+});
+
+/**
+ * P1 富文本三件（2026-09-06）：附件 ref 建模渲染（合并 gallery + 文件附件
+ * chip）与文件类工具的文件卡片（chip 替换 JSON <pre> 直出）。
+ */
+describe("MessageBubble 附件区（P1-①③：正文后合并 gallery + file chip）", () => {
+  it("msg.images 与 attachments 里的 image 合并为一个 gallery（不各自成组）", () => {
+    const { container } = render(
+      <MessageBubble
+        msg={mkMsg([{ type: "text", content: "看图" }], {
+          images: ["data:image/png;base64,AAA"],
+          attachments: [
+            { kind: "image", name: "b.png", urlOrId: "https://example.com/b.png" },
+            { kind: "file", name: "spec.md", urlOrId: "att_spec", bytes: 2048 },
+          ],
+        })}
+      />,
+    );
+    const galleries = container.querySelectorAll("[data-hw-gallery]");
+    expect(galleries).toHaveLength(1);
+    expect(galleries[0].querySelectorAll("img")).toHaveLength(2);
+    // gallery 在正文之后（附件区在正文后）
+    const text = screen.getByText("看图");
+    expect(text.compareDocumentPosition(galleries[0]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // file 附件 → chip（名称 + 大小），不走 gallery
+    expect(screen.getByText("spec.md")).toBeInTheDocument();
+    expect(screen.getByText("2.0 KB")).toBeInTheDocument();
+  });
+
+  it("attachments 图片为不透明存储 id（非 URL）时不出碎图", () => {
+    const { container } = render(
+      <MessageBubble
+        msg={mkMsg([], {
+          attachments: [{ kind: "image", name: "a.png", urlOrId: "att_123" }],
+        })}
+      />,
+    );
+    expect(container.querySelector("[data-hw-gallery]")).toBeNull();
+  });
+});
+
+describe("MessageBubble 文件卡片（P1-②：文件类工具 chip 替换 JSON <pre>）", () => {
+  it("write_file：文件 chip（文件名 + result 首行摘要 + 复制按钮），无 JSON dump", () => {
+    const { container } = render(
+      <MessageBubble
+        msg={mkMsg([
+          {
+            type: "tool_call",
+            tool: {
+              tool: "write_file",
+              input: { filePath: "src/deep/nested/mod.ts", content: "…" },
+              status: "ok",
+              result: "Updated src/… hmm\n+2 lines",
+            },
+          },
+        ])}
+      />,
+    );
+    const chip = container.querySelector("[data-file-chip]")!;
+    expect(chip).not.toBeNull();
+    // 文件名剥路径（title 保留全路径）
+    expect(chip.textContent).toContain("mod.ts");
+    expect(chip.textContent).toContain("Updated src/… hmm");
+    // JSON <pre> 直出被替换
+    expect(container.querySelector("pre")).toBeNull();
+    // 复制按钮存在
+    expect(screen.getByRole("button", { name: "复制文件路径" })).toBeInTheDocument();
+  });
+
+  it("复制按钮写剪贴板（含全路径），成功后短暂反馈；失败静默不抛错", async () => {
+    let written: string | null = null;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: (s: string) => { written = s; return Promise.resolve(); } },
+    });
+    const { container } = render(
+      <MessageBubble
+        msg={mkMsg([
+          {
+            type: "tool_call",
+            tool: {
+              tool: "edit_file",
+              input: { filePath: "lib/a.py", old_string: "x", new_string: "y" },
+              status: "ok",
+              result: "Updated lib/a.py (+1 lines)",
+            },
+          },
+        ])}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "复制文件路径" }));
+    expect(written).toBe("lib/a.py");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "已复制文件路径" })).toBeInTheDocument(),
+    );
+    // 失败静默：clipboard 拒绝也不抛
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: () => Promise.reject(new Error("denied")) },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "已复制文件路径" }));
+  });
+
+  it("失败工具：摘要取 error 首行并标红（text-red-600）", () => {
+    const { container } = render(
+      <MessageBubble
+        msg={mkMsg([
+          {
+            type: "tool_call",
+            tool: {
+              tool: "read_file",
+              input: { path: "nope.txt" },
+              status: "error",
+              result: "FileNotFoundError: nope.txt\n  at …",
+            },
+          },
+        ])}
+      />,
+    );
+    const chip = container.querySelector("[data-file-chip]")!;
+    expect(chip.textContent).toContain("FileNotFoundError: nope.txt");
+    expect(chip.textContent).toContain("nope.txt");
+    expect(chip.querySelector(".text-red-600")).not.toBeNull();
+  });
+
+  it("非文件工具保持现状：仍有 JSON <pre> 展开，无文件 chip", () => {
+    const { container } = render(
+      <MessageBubble
+        msg={mkMsg([
+          {
+            type: "tool_call",
+            tool: { tool: "list_files", input: { dirPath: "src" }, status: "ok", result: "a.ts\nb.ts" },
+          },
+        ])}
+      />,
+    );
+    expect(container.querySelector("[data-file-chip]")).toBeNull();
+    // 标准行可展开 JSON —— 点行头后出现 pre
+    fireEvent.click(container.querySelector("button")!);
+    expect(container.querySelector("pre")?.textContent).toContain("dirPath");
+  });
+});
+
+describe("MessageBubble 文件卡片（P1-②）：clipboard 缺失环境", () => {
+  it("navigator.clipboard 为 undefined 时点复制不抛错（?. 链到 .then）", () => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
+    const { container } = render(
+      <MessageBubble
+        msg={mkMsg([
+          {
+            type: "tool_call",
+            tool: { tool: "write_file", input: { filePath: "a.ts" }, status: "ok" },
+          },
+        ])}
+      />,
+    );
+    expect(() =>
+      fireEvent.click(screen.getByRole("button", { name: "复制文件路径" })),
+    ).not.toThrow();
+    expect(container.querySelector("[data-file-chip]")).not.toBeNull();
   });
 });

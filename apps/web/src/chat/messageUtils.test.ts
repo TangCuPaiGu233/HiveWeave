@@ -3,7 +3,11 @@ import {
   appendToolCallSegment,
   applyToolResult,
   beginStreamRound,
+  collectFileAttachments,
+  collectMessageImages,
   draftFromStreamingMessage,
+  extractToolFilePath,
+  FILE_CHIP_SUMMARY_MAX,
   isTeamChannelMessage,
   mapDbToChatMessages,
   mergeStreamDraftIntoMessages,
@@ -13,6 +17,7 @@ import {
   shouldWriteChatCache,
   streamEventBackgroundFlag,
   streamEventIsBackground,
+  toolResultFirstLine,
   tryParseToolCalls,
 } from "./messageUtils";
 import type { ChatMessage, StreamDraft } from "./types";
@@ -519,5 +524,129 @@ describe("settledMessageHasSegments（八轮收口竞态 fetch-then-swap 判据�
   it("目标消息不存在（未走流式的纯文本路径）放行", () => {
     expect(settledMessageHasSegments([mk({ id: "other" })], "m1")).toBe(true);
     expect(settledMessageHasSegments([], null)).toBe(true);
+  });
+});
+
+/**
+ * P1 富文本（2026-09-06）：附件 ref 合并 gallery、文件 chip 路径/摘要提取。
+ */
+describe("collectMessageImages（msg.images + attachments image 并一个 gallery）", () => {
+  it("images 在前、attachments image 在后，合为单列表（DSH 连续 image 并组语义）", () => {
+    const imgs = collectMessageImages({
+      images: ["data:image/png;base64,AAA"],
+      attachments: [
+        { kind: "image", name: "b.png", urlOrId: "https://x/b.png", width: 480, height: 240 },
+        { kind: "file", name: "c.pdf", urlOrId: "att_c" },
+        { kind: "image", name: "d.png", urlOrId: "data:image/png;base64,BBB" },
+      ],
+    });
+    expect(imgs).toHaveLength(3);
+    expect(imgs.map((i) => i.src)).toEqual([
+      "data:image/png;base64,AAA",
+      "https://x/b.png",
+      "data:image/png;base64,BBB",
+    ]);
+    expect(imgs[1]).toMatchObject({ name: "b.png", width: 480, height: 240 });
+  });
+
+  it("attachments 的不透明存储 id（非 URL）跳过 —— 后端句柄解析落地前不渲染碎图", () => {
+    const imgs = collectMessageImages({
+      attachments: [
+        { kind: "image", name: "a.png", urlOrId: "att_123" },
+        { kind: "image", name: "b.png", urlOrId: "blob:xyz" },
+      ],
+    });
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0].src).toBe("blob:xyz");
+  });
+
+  it("空消息/空数组 → 空列表", () => {
+    expect(collectMessageImages({})).toEqual([]);
+    expect(collectMessageImages({ images: [], attachments: [] })).toEqual([]);
+  });
+});
+
+describe("collectFileAttachments", () => {
+  it("只留 kind===file 的附件", () => {
+    const atts = collectFileAttachments({
+      attachments: [
+        { kind: "image", name: "a.png", urlOrId: "https://x/a.png" },
+        { kind: "file", name: "spec.md", urlOrId: "att_1", bytes: 2048 },
+      ],
+    });
+    expect(atts).toHaveLength(1);
+    expect(atts[0].name).toBe("spec.md");
+  });
+});
+
+describe("extractToolFilePath（文件 chip 路径提取）", () => {
+  it("write_file/read_file/edit_file：filePath 与 path 别名", () => {
+    expect(extractToolFilePath("write_file", { filePath: "src/a.ts" })).toBe("src/a.ts");
+    expect(extractToolFilePath("read_file", { path: "docs/b.md" })).toBe("docs/b.md");
+    expect(extractToolFilePath("edit_file", { file_path: "lib/c.py" })).toBe("lib/c.py");
+  });
+
+  it("apply_patch：patches[] 里取第一个带 filePath 的 op，也支持直挂顶层", () => {
+    expect(
+      extractToolFilePath("apply_patch", {
+        patches: [
+          { op: "update", filePath: "src/x.ts", oldString: "a", newString: "b" },
+          { op: "add", filePath: "src/y.ts", content: "c" },
+        ],
+      }),
+    ).toBe("src/x.ts");
+    expect(
+      extractToolFilePath("apply_patch", { filePath: "direct.ts", newString: "b" }),
+    ).toBe("direct.ts");
+  });
+
+  it("非文件工具 / 提取不到路径 → null（回落标准行）", () => {
+    expect(extractToolFilePath("bash", { command: "ls" })).toBeNull();
+    expect(extractToolFilePath("apply_patch", { patches: [] })).toBeNull();
+    expect(extractToolFilePath("write_file", undefined)).toBeNull();
+  });
+});
+
+describe("toolResultFirstLine（文件 chip 单行摘要）", () => {
+  it("成功取首行（Updated x (+2 lines) 类），失败取 error 首行", () => {
+    expect(toolResultFirstLine("Updated src/a.ts (+2 lines)\nsecond\nthird")).toBe(
+      "Updated src/a.ts (+2 lines)",
+    );
+    expect(toolResultFirstLine("FileNotFoundError: no such file\nstack…")).toBe(
+      "FileNotFoundError: no such file",
+    );
+  });
+
+  it("跳过前导空行；全空白 → null；非字符串 → null", () => {
+    expect(toolResultFirstLine("\n\n  Created docs/d.md")).toBe("Created docs/d.md");
+    expect(toolResultFirstLine("  \n \n")).toBeNull();
+    expect(toolResultFirstLine(undefined)).toBeNull();
+  });
+
+  it("超长单行按 FILE_CHIP_SUMMARY_MAX 硬截加省略号", () => {
+    const long = "x".repeat(300);
+    const out = toolResultFirstLine(long)!;
+    expect(out.length).toBe(FILE_CHIP_SUMMARY_MAX + 1);
+    expect(out.endsWith("…")).toBe(true);
+  });
+});
+
+describe("mapDbToChatMessages attachments 透传（后端回传待接的 metadata 口）", () => {
+  it("metadata.attachments（JSON 字符串）→ 结构化数组，坏条目丢弃", () => {
+    const meta = JSON.stringify({
+      attachments: [
+        { kind: "file", name: "a.md", urlOrId: "att_a", bytes: 10 },
+        { kind: "nope", name: "bad", urlOrId: "x" },
+        "garbage",
+      ],
+    });
+    const [m] = mapDbToChatMessages([{ id: "m1", role: "assistant", content: "", metadata: meta }]);
+    expect(m.attachments).toHaveLength(1);
+    expect(m.attachments![0]).toMatchObject({ kind: "file", name: "a.md", urlOrId: "att_a" });
+  });
+
+  it("无 metadata / 无 attachments → undefined，不破坏现状", () => {
+    const [m] = mapDbToChatMessages([{ id: "m1", role: "assistant", content: "" }]);
+    expect(m.attachments).toBeUndefined();
   });
 });

@@ -1,4 +1,5 @@
 import type {
+  AttachmentRef,
   ChatMessage,
   ContextMarkerKind,
   MsgSegment,
@@ -390,6 +391,39 @@ export function inferMessageSource(
   return undefined;
 }
 
+/** metadata.attachments → AttachmentRef[]（形状不对的条目丢弃，不抛错）。
+ *  后端当前不产 attachments（chat_messages 无该列）—— 此处是前端先行
+ *  建模的透传口：后端将来往 metadata 里写 attachments 即自动生效。 */
+function normalizeAttachments(raw: unknown): AttachmentRef[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const out: AttachmentRef[] = [];
+  for (const a of raw) {
+    if (!a || typeof a !== "object") continue;
+    const rec = a as Record<string, unknown>;
+    const kind = rec.kind === "image" || rec.kind === "file" ? rec.kind : undefined;
+    const name = typeof rec.name === "string" ? rec.name : undefined;
+    const urlOrId = typeof rec.urlOrId === "string" ? rec.urlOrId : undefined;
+    if (!kind || !urlOrId) continue;
+    // 审计 #2/#3：name 缺失不得回落 urlOrId（句柄可能是整条 data URL，
+    // 塞进 chip/title 是垃圾展示）；防御性 basename 剥离（约定产出方剥，
+    // 这里纵深兜底）。
+    const safeName =
+      typeof name === "string" && name.trim()
+        ? name.trim().split(/[\/]/).pop() || "unnamed"
+        : "unnamed";
+    out.push({
+      kind,
+      name: safeName,
+      mediaType: typeof rec.mediaType === "string" ? rec.mediaType : undefined,
+      bytes: typeof rec.bytes === "number" ? rec.bytes : undefined,
+      width: typeof rec.width === "number" ? rec.width : undefined,
+      height: typeof rec.height === "number" ? rec.height : undefined,
+      urlOrId,
+    });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 export function mapDbToChatMessages(dbMessages: any[]): ChatMessage[] {
   if (!Array.isArray(dbMessages)) return [];
   return dbMessages.map((m: any) => {
@@ -400,6 +434,7 @@ export function mapDbToChatMessages(dbMessages: any[]): ChatMessage[] {
       content: m.content,
       _thinking: m.thinking || undefined,
       images: typeof m.images === "string" ? tryParseImages(m.images) : m.images,
+      attachments: normalizeAttachments(meta?.attachments),
       timestamp: m.createdAt ?? m.created_at ?? Date.now(),
       toolCalls: m.toolCalls ?? m.tool_calls
         ? tryParseToolCalls(m.toolCalls ?? m.tool_calls)
@@ -504,6 +539,118 @@ export function formatToolInputHint(tool: string, input: Record<string, any> | u
   if (generic) {
     const max = 48;
     return generic.length > max ? generic.slice(0, max) + "\u2026" : generic;
+  }
+  return null;
+}
+
+/**
+ * P1 gallery（2026-09-06）：一条消息的全部图片合成一个 gallery 网格 ——
+ * msg.images（既有通路，data URL）在前，attachments 里 kind==="image" 的
+ * 在后（学 DSH AssistantMarkdown.tsx:72-95 的「连续 image 块并组」：HiveWeave
+ * 的图片都挂在消息级而非块级，这里就是唯一的并组点）。
+ *
+ * attachments 的 urlOrId 若是不透明存储 id（非 URL）则无法直接渲染，跳过 ——
+ * 等后端落地存储句柄解析后在此接 loader。msg.images 保持既有行为原样透传
+ * （不设协议门槛，避免破坏存量渲染）。
+ */
+export interface GalleryImage {
+  src: string;
+  name?: string;
+  width?: number;
+  height?: number;
+}
+
+/** attachments 图片只收可直接渲染的 URL 形态（存储 id 留待后端回传待接）。 */
+const RENDERABLE_URL_RE = /^(https?:|data:|blob:)/i;
+
+export function collectMessageImages(
+  msg: Pick<ChatMessage, "images" | "attachments">,
+): GalleryImage[] {
+  const out: GalleryImage[] = [];
+  // Array.isArray 双保险：异常 payload（非数组真值）静默跳过，不抛错断渲染
+  if (Array.isArray(msg.images)) {
+    for (const src of msg.images) {
+      if (typeof src === "string" && src) out.push({ src });
+    }
+  }
+  if (Array.isArray(msg.attachments)) {
+    for (const a of msg.attachments) {
+      if (a && a.kind === "image" && RENDERABLE_URL_RE.test(a.urlOrId)) {
+        out.push({
+          src: a.urlOrId,
+          name: a.name,
+          width: typeof a.width === "number" ? a.width : undefined,
+          height: typeof a.height === "number" ? a.height : undefined,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/** 消息里 kind==="file" 的附件（文件 chip 渲染用）。 */
+export function collectFileAttachments(
+  msg: Pick<ChatMessage, "attachments">,
+): AttachmentRef[] {
+  return Array.isArray(msg.attachments)
+    ? msg.attachments.filter((a) => a && a.kind === "file")
+    : [];
+}
+
+/**
+ * P1 文件卡片（2026-09-06）：文件类工具调用渲染为文件 chip，替换 JSON
+ * `<pre>` 直出。覆盖 write_file / read_file / edit_file / apply_patch（其他
+ * 工具保持现状）。apply_patch 的路径可能在 patches[] 数组各项里，也可能
+ * 直挂顶层（后端 executor.py apply_patch schema 两种形态都收）。
+ */
+export const FILE_CHIP_TOOLS: ReadonlySet<string> = new Set([
+  "write_file",
+  "read_file",
+  "edit_file",
+  "apply_patch",
+]);
+
+/** 从工具 input 提取目标文件路径；提取不到返回 null（chip 不渲染）。 */
+export function extractToolFilePath(
+  tool: string,
+  input: Record<string, any> | undefined | null,
+): string | null {
+  if (!FILE_CHIP_TOOLS.has(tool) || !input || typeof input !== "object") return null;
+  const pickStr = (v: unknown): string | null =>
+    typeof v === "string" && v.trim() ? v.trim() : null;
+  const direct =
+    pickStr(input.filePath) ??
+    pickStr(input.file_path) ??
+    pickStr(input.path) ??
+    pickStr(input.file);
+  if (direct) return direct;
+  if (tool === "apply_patch" && Array.isArray(input.patches)) {
+    for (const patch of input.patches) {
+      if (patch && typeof patch === "object") {
+        const p = pickStr((patch as Record<string, unknown>).filePath);
+        if (p) return p;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * 文件 chip 的单行摘要：result 首个非空行（成功=「Updated x (+2 lines)」类
+ * 首行；失败=error 首行）。超长截断由 chip 的 CSS truncate 兜底，这里再按
+ * 字符硬截一次防异常大单行。
+ */
+export const FILE_CHIP_SUMMARY_MAX = 120;
+
+export function toolResultFirstLine(result: string | undefined | null): string | null {
+  if (typeof result !== "string") return null;
+  for (const line of result.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed) {
+      return trimmed.length > FILE_CHIP_SUMMARY_MAX
+        ? trimmed.slice(0, FILE_CHIP_SUMMARY_MAX) + "…"
+        : trimmed;
+    }
   }
   return null;
 }

@@ -33,11 +33,35 @@ export type MessageSource =
  */
 export type ContextMarkerKind = "compaction" | "prune";
 
+/**
+ * 聊天附件引用（学 DSH ImageAttachmentRef 的字段语义，见
+ * docs/2026-09-05/chat-rich-text-design.md §2 P1）：
+ * - `urlOrId` 是存储句柄（不透明 id 或 URL），**优先于**内联 base64 ——
+ *   持久化引用走句柄，避免把字节塞进消息体。
+ * - `name` 仅供显示，产出方必须剥掉本地路径成分（DSH types.ts:22-23）。
+ * - `mediaType` 应由存储字节验证，不信任声明方。
+ * 注意：后端 chat_messages 表/接口当前**没有** attachments 字段（只有
+ * images TEXT），该字段是前端先行建模 —— 后端回传待接（见 P1 完成报告）。
+ */
+export interface AttachmentRef {
+  kind: "image" | "file";
+  /** 显示名（剥路径，只留文件名）。 */
+  name: string;
+  mediaType?: string;
+  bytes?: number;
+  width?: number;
+  height?: number;
+  /** 存储句柄：不透明附件 id 或可直接渲染/下载的 URL。 */
+  urlOrId: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "system" | "team";
   content: string;
   images?: string[];
+  /** 结构化附件（图片走 gallery，file 走文件 chip）。后端回传待接。 */
+  attachments?: AttachmentRef[];
   timestamp: number;
   toolCalls?: ToolCall[];
   isBackground?: boolean;

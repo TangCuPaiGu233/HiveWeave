@@ -1,9 +1,16 @@
-import { memo, useState } from "react";
-import type { ChatMessage, ContextMarkerKind, ToolCall } from "./types";
+import { memo, useEffect, useState } from "react";
+import type { AttachmentRef, ChatMessage, ContextMarkerKind, ToolCall } from "./types";
 import { CHAT_MOTION_CSS, toolCategories } from "./constants";
-import { formatToolInputHint } from "./messageUtils";
+import {
+  collectFileAttachments,
+  collectMessageImages,
+  extractToolFilePath,
+  formatToolInputHint,
+  toolResultFirstLine,
+} from "./messageUtils";
 import { estimateMessageTokens, estimateTokens } from "./tokenEstimate";
 import { MarkdownText } from "./MarkdownText";
+import { ImageGallery } from "./ImageGallery";
 
 /**
  * DSH 风格思考行：单行 `Think · 摘要`，点击展开全文。
@@ -112,6 +119,147 @@ function ToolStatusIcon({ status }: { status?: ToolCall["status"] }) {
 // legacy/异常大 payload 撑爆 DOM（阈值与后端 TOOL_RESULT_PERSIST_EXCERPT 对齐）。
 const RESULT_RENDER_MAX = 2000;
 
+/** 复制成功的短暂反馈时长（ms）；期间图标换成对勾。 */
+const COPIED_FEEDBACK_MS = 1500;
+
+/**
+ * P1 文件卡片（2026-09-06）：write_file / read_file / edit_file / apply_patch
+ * 类工具调用渲染为文件 chip（图标 + 文件名 + 单行摘要 + 状态 + 复制路径），
+ * 替换原 JSON `<pre>` 直出。摘要 = result 首个非空行（成功=「Updated x
+ * (+2 lines)」类首行；失败=error 首行，红色）。「打开」按钮不做 —— 前端
+ * 没有现成的打开本地文件机制，不为此造新 IPC 面，只留复制。
+ */
+function FileToolChip({ call, path }: { call: ToolCall; path: string }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const t = window.setTimeout(() => setCopied(false), COPIED_FEEDBACK_MS);
+    return () => window.clearTimeout(t);
+  }, [copied]);
+  const fileName = path.split(/[\\/]/).pop() || path;
+  const summary = toolResultFirstLine(call.result);
+  const isError = call.status === "error";
+  const copy = () => {
+    // 无剪贴板环境（jsdom / 非安全上下文）与权限拒绝一律静默。
+    // 注意 ?. 必须链到 .then：clipboard 缺失时 writeText 短路为 undefined，
+    // 对 undefined 调 .then 会抛 TypeError。
+    navigator.clipboard?.writeText(path)?.then(
+      () => setCopied(true),
+      () => {},
+    );
+  };
+  return (
+    // 可达性：整行是展示性 chip，唯一交互是复制按钮（见下），行本身不带点击。
+    <div className="my-0.5 flex items-center gap-2 py-1 px-1 -mx-1 rounded-md" data-file-chip="">
+      <svg
+        className="w-3 h-3 shrink-0 text-slate-500"
+        fill="none"
+        viewBox="0 0 24 24"
+        stroke="currentColor"
+        strokeWidth={2}
+        aria-hidden="true"
+      >
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"
+        />
+        <path strokeLinecap="round" strokeLinejoin="round" d="M14 2v6h6" />
+      </svg>
+      <span className="font-mono text-[11px] font-medium text-g-fg-2 shrink-0" title={path}>
+        {fileName}
+      </span>
+      {summary && (
+        <>
+          <span className="text-g-fg-4 text-[11px] shrink-0">·</span>
+          <span
+            className={`text-[11px] truncate min-w-0 ${isError ? "text-red-600" : "text-g-fg-4"}`}
+            title={call.result}
+          >
+            {summary}
+          </span>
+        </>
+      )}
+      <span className="ml-auto shrink-0 flex items-center gap-1">
+        <button
+          type="button"
+          aria-label={copied ? "已复制文件路径" : "复制文件路径"}
+          title="复制路径"
+          onClick={copy}
+          className="p-0.5 rounded text-g-fg-4 hover:text-g-fg-2 hover:bg-g-bg-muted/70 transition-colors"
+        >
+          {copied ? (
+            <svg
+              className="w-3 h-3 text-emerald-500"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={2.5}
+              aria-hidden="true"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+            </svg>
+          ) : (
+            <svg
+              className="w-3 h-3"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={2}
+              aria-hidden="true"
+            >
+              <rect x="9" y="9" width="13" height="13" rx="2" />
+              <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+            </svg>
+          )}
+        </button>
+        <ToolStatusIcon status={call.status} />
+      </span>
+    </div>
+  );
+}
+
+/**
+ * 消息附件里的 file 附件 chip（AttachmentRef kind==="file"）：展示名 + 大小，
+ * 纯展示不设交互（urlOrId 可能是不透明存储 id，复制/打开都无意义，等后端
+ * 落地存储句柄再谈）。
+ */
+function FileAttachmentChip({ att, onUserSide }: { att: AttachmentRef; onUserSide: boolean }) {
+  const size =
+    typeof att.bytes === "number" && att.bytes > 0 ? formatBytes(att.bytes) : undefined;
+  return (
+    <span
+      className={`inline-flex max-w-[16rem] items-center gap-1.5 rounded-lg px-2 py-1 text-[11px] ${
+        onUserSide ? "bg-white/15 text-white ring-1 ring-white/30" : "border border-g-border bg-g-bg-muted/60 text-g-fg-2"
+      }`}
+      title={att.mediaType ? `${att.name} · ${att.mediaType}` : att.name}
+    >
+      <svg
+        className="w-3 h-3 shrink-0 opacity-70"
+        fill="none"
+        viewBox="0 0 24 24"
+        stroke="currentColor"
+        strokeWidth={2}
+        aria-hidden="true"
+      >
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          d="M15.172 7l-8.586 8.586a2 2 0 102.828 2.828l6.414-6.414a4 4 0 10-5.656-5.656l-6.415 6.414a6 6 0 108.486 8.486L20 13"
+        />
+      </svg>
+      <span className="truncate">{att.name}</span>
+      {size && <span className="shrink-0 opacity-60">{size}</span>}
+    </span>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 /**
  * DSH 风格工具行：单行 `● tool_name · 参数 ✓`，点击展开入参与结果。
  *
@@ -121,6 +269,14 @@ const RESULT_RENDER_MAX = 2000;
  */
 function ToolCallRow({ call }: { call: ToolCall }) {
   const [showDetail, setShowDetail] = useState(false);
+  // P1 文件卡片：文件类工具（write_file/read_file/edit_file/apply_patch）且
+  // 能从 input 提取到路径 → 文件 chip 替换整行（含 JSON <pre> 展开）；
+  // 提取不到路径（apply_patch 空 patches 等）回落标准行，其他工具保持现状。
+  // 注意分支在 useState 之后 —— 保持 hooks 顺序无条件。
+  const filePath = extractToolFilePath(call.tool, call.input);
+  if (filePath) {
+    return <FileToolChip call={call} path={filePath} />;
+  }
   const hint = formatToolInputHint(call.tool, call.input);
   const cat = toolCategories[call.tool];
   const catDot = cat ? cat.color.replace("text-", "bg-") : "bg-g-fg-4";
@@ -392,6 +548,12 @@ function MessageBubbleInner({
   const isEmpty =
     !msg.content && !thinking && !hasSegments && (!msg.toolCalls || msg.toolCalls.length === 0);
 
+  // P1 附件区（2026-09-06）：msg.images（既有通路）与 attachments 里
+  // kind==="image" 的合并为**一个** gallery（学 DSH AssistantMarkdown.tsx:72-95
+  // 连续 image 块并组），file 附件出文件 chip —— 都渲染在正文后。
+  const galleryImages = collectMessageImages(msg);
+  const fileAtts = collectFileAttachments(msg);
+
   // 生成统计：tokens 用与后端一致的 char-ratio 估算；速率流式期间实时
   // （draft.startedAt 起算），完成后用冻结的 _genStats.ms 做分母——分子
   // 恒为渲染时的估算，与显示的 "~N tok" 同口径。
@@ -442,19 +604,6 @@ function MessageBubbleInner({
             )}
           </div>
         )}
-        {msg.images && msg.images.length > 0 && (
-          <div className="flex gap-1.5 flex-wrap mb-3">
-            {msg.images.map((url, i) => (
-              <img
-                key={i}
-                src={url}
-                className={`max-h-48 max-w-[200px] rounded-lg object-cover ${isUser ? "ring-1 ring-white/30" : "border border-g-border"}`}
-                alt=""
-              />
-            ))}
-          </div>
-        )}
-
         {hasSegments ? (
           <div>
             {!isUser && thinking && !segmentsHaveThinking && <ThinkingBlock content={thinking} />}
@@ -507,6 +656,18 @@ function MessageBubbleInner({
 
         {!isUser && isStreaming && hasSegments && (
           <span className="inline-block w-[3px] h-4 rounded-full bg-g-blue ml-1 align-middle hw-stream-cursor" />
+        )}
+
+        {/* P1 附件区：正文（含光标）之后 —— 图片合并 gallery，file 附件出 chip。 */}
+        {galleryImages.length > 0 && (
+          <ImageGallery images={galleryImages} align={isUser ? "end" : "start"} />
+        )}
+        {fileAtts.length > 0 && (
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            {fileAtts.map((att, i) => (
+              <FileAttachmentChip key={`${att.urlOrId}:${i}`} att={att} onUserSide={isUser} />
+            ))}
+          </div>
         )}
 
         {!isUser && isEmpty && isStreaming && (

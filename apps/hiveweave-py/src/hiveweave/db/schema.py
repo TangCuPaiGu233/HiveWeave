@@ -413,7 +413,8 @@ PROJECT_DB_TABLES = [
         console_errors INTEGER,
         created_at INTEGER NOT NULL,
         expires_at INTEGER,
-        project_id TEXT NOT NULL
+        project_id TEXT NOT NULL,
+        waiver_kind TEXT
     )
     """,
     """ALTER TABLE tasks ADD COLUMN policy_id TEXT""",

@@ -17,6 +17,7 @@ to a soft-fail dict with a machine-readable ``reason``.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -111,16 +112,20 @@ CODE_AUDIT_REMINDER = (
     "before submit_task to get a second-pass LLM audit of your worktree diff."
 )
 # P0-3（fail-loud）后 llm_failed 不再"静默放行"：code_audit 仍是必需证据，
-# submit 会被门禁拦下，出路只有两条——重试到审计成功，或由 coordinator 显式
-# waive。旧文案"soft gate — does not block"是 fail-loud 之前的残留，会误导
-# Agent 以为可以直接提交（s3-clone_06 实测）。
+# submit 会被门禁拦下。审计 epic（42 轮报告）：llm_failed 全是分钟级上游
+# 暂态，旧文案教 agent「反复失败就请 coordinator waive」直接导致 16 次
+# llm_failed → 全部走 waive、6 次级联。新口径：平台自动排队重试并回填
+# 通知，agent 等待即可；多次自动重试仍失败才考虑 waive（真实人工决策）。
 CODE_AUDIT_REMINDER_LLM_FAILED = (
     "[CODE AUDIT REMINDER] Code audit was attempted but the LLM call failed "
-    "(llm_failed). Retry request_code_audit(taskId=...) — {timeout_s}s "
-    "timeout, the audit takes 30-90s on real diffs. If it keeps failing, the "
-    "submit gate stays CLOSED: ask a coordinator to run "
-    "waive_attestation(taskId=..., reason=...) with the fallback evidence "
-    "you do have (test_run results). Silently submitting will be rejected."
+    "(llm_failed). This is NOT missing evidence on your side — the platform "
+    "auto-enqueues a background retry and will notify you in your inbox "
+    "when it succeeds (audit takes 30-90s on real diffs; timeout cap "
+    "{timeout_s}s). Wait for the retry notice instead of looping "
+    "request_code_audit. Only if repeated auto-retries still fail, a "
+    "coordinator may run waive_attestation(taskId=..., reason=...) — a "
+    "real human decision, not your default escape. Silently submitting "
+    "will be rejected."
 )
 CODE_AUDIT_REMINDER_ATTEMPTED = (
     "[CODE AUDIT REMINDER] Code audit was attempted but did not produce an "
@@ -439,15 +444,29 @@ async def collect_worktree_diff(worktree_path: str) -> str:
 
 # ── Audit prompt (platform English constants) ────────────────
 
-def build_audit_prompt(diff: str, task_id: str | None) -> tuple[str, str]:
+def build_audit_prompt(
+    diff: str,
+    task_id: str | None,
+    acceptance_criteria: list[str] | None = None,
+    appeal_notes: str | None = None,
+) -> tuple[str, str]:
     """Build (system, user) prompt pair for the audit call.
 
     Platform English constants only (protocol, language-agnostic). The
     model's reply MUST start with ``VERDICT: PASS`` or ``VERDICT: ISSUES``.
+
+    审计 epic P0-2（42 轮报告）：审计 LLM 此前只喂 diff 与裸任务 ID，规格
+    强制的行为（如默认 admin token）被反复标 [high]，合法实现只能豁免。
+    这里注入两节上下文（取不到就跳过该节）：
+      - 任务验收标准：规格/验收标准要求的行为不是缺陷，对照判断。
+      - 作者申诉：仅参考，审计须独立核实，不因申诉自动放行。
     """
     system = (
         "You are a second-pass code reviewer auditing an agent's worktree "
         "diff. Assess correctness, security, and obvious defects. "
+        "Behavior that the task spec / acceptance criteria explicitly "
+        "requires is NOT a defect — judge against the acceptance criteria "
+        "when they are provided. "
         "Your reply MUST start with exactly one line: 'VERDICT: PASS' or "
         "'VERDICT: ISSUES'. When the verdict is ISSUES, follow with one "
         "line per problem in the form: <file>:<line> [<severity>] <one-line "
@@ -456,7 +475,48 @@ def build_audit_prompt(diff: str, task_id: str | None) -> tuple[str, str]:
     context = (
         f"task context: {task_id}" if task_id else "task context: not provided"
     )
-    return system, f"{context}\n\nworktree diff:\n{diff}"
+    sections = [context]
+    criteria = [
+        str(c).strip() for c in (acceptance_criteria or []) if str(c).strip()
+    ]
+    if criteria:
+        bullets = "\n".join(f"- {c}" for c in criteria[:20])
+        sections.append(
+            "任务验收标准（spec/acceptance criteria 要求的行为不是缺陷，"
+            f"对照判断）:\n{bullets}"
+        )
+    appeal = str(appeal_notes or "").strip()
+    if appeal:
+        sections.append(
+            "作者申诉（仅参考，审计须独立核实，不因申诉自动放行）:\n"
+            + appeal[:4000]
+        )
+    return system, "\n\n".join(sections) + f"\n\nworktree diff:\n{diff}"
+
+
+async def load_task_acceptance_criteria(
+    project_id: str, task_id: str | None
+) -> list[str] | None:
+    """任务验收标准（tasks.acceptance_criteria JSON 列，list[str]）。
+
+    审计 epic P0-2：给审计 LLM 对照规格判断。Fail-open：任务不存在 /
+    解析失败 / 非列表 → None（prompt 跳过该节）。绝不 raise。
+    """
+    if not task_id:
+        return None
+    try:
+        from hiveweave.services.task import TaskService
+
+        row = await TaskService().get_task(project_id, str(task_id))
+        raw = (row or {}).get("acceptance_criteria")
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        if not isinstance(raw, list):
+            return None
+        out = [str(x) for x in raw if str(x or "").strip()]
+        return out or None
+    except Exception:  # noqa: BLE001 — 审计 prompt 上下文是 best-effort
+        return None
 
 
 def _parse_verdict(text: str) -> str:
@@ -479,6 +539,25 @@ def _parse_issues(text: str) -> list[str]:
         if len(issues) >= _ISSUE_PARSE_CAP:
             break
     return issues
+
+
+def _parse_cached_issues(raw: object) -> list[str]:
+    """audit_cache.top_issues（JSON 数组字符串或 list）→ 非空 issue 行列表。
+
+    审计 epic P0-1：缓存回放原结论的 issue 行。任何解析失败 → 空列表
+    （不阻断缓存复用，仅少回放明细）。
+    """
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:  # noqa: BLE001 — 脏数据退化为空
+            return []
+        items = parsed if isinstance(parsed, list) else []
+    else:
+        return []
+    return [str(x).strip() for x in items if str(x or "").strip()]
 
 
 # ── Peer model pick (live team, different vendor model_id) ───
@@ -718,6 +797,7 @@ async def run_code_audit(
     task_id: str | None = None,
     call_llm: ReviewLLMCallback | None = None,
     oneshot_llm: OneshotLLMCallback | None = None,
+    appeal_notes: str | None = None,
 ) -> dict:
     """Run a code audit for an agent's worktree. Never raises.
 
@@ -727,9 +807,12 @@ async def run_code_audit(
     (``async (system, user) -> str``) — tests and fallback (author's own
     model). ``None`` for both soft-fails with ``no_callback`` once an LLM
     verdict is actually needed; the auto-PASS path never touches either.
+    ``appeal_notes``（审计 epic P0-2）：作者对 finding 的申诉（认为某些
+    行为系规格要求），注入 prompt 申诉节，审计独立核实不自动放行。
 
     Return contract (soft-fail dicts):
       - ``{"audited": False, "reason": "no_worktree" | "no_callback" | "no_model" | "llm_failed" | "error"}``
+        （llm_failed 且成功入队时附 ``retry_queued`` / ``retry_attempts``）
       - ``{"audited": True, "verdict": "PASS" | "ISSUES", ...}``
     """
     try:
@@ -841,6 +924,16 @@ async def run_code_audit(
                 str(cached_hit.get("verdict") or "").strip()
                 or ("PASS" if cached_exit == 0 else "ISSUES")
             )
+            # 审计 epic P0-1（42 轮报告）：缓存命中要回放**原结论**——
+            # 旧实现回执「ISSUES / 0 行 / 0 问题」自相矛盾，agent 误判审计
+            # 空转后 12 次重审赌结果。issue 列表随缓存落库（P0-1 新列），
+            # 行数用当前台账值（本次会话累计未审行）。
+            cached_issues = _parse_cached_issues(cached_hit.get("top_issues"))
+            cached_source = str(
+                cached_hit.get("source_attestation_id")
+                or cached_hit.get("attestation_id")
+                or ""
+            ).strip()
             attestation_id = await attestation_service.create(
                 project_id,
                 agent_id=agent_id,
@@ -852,19 +945,24 @@ async def run_code_audit(
                 stdout_hash=hash_stdout(f"cached audit reuse {diff_hash}"),
                 command_or_url=f"[verdict={verdict_cached}] cached-reuse",
             )
+            lines_now = get_unaudited_lines(agent_id)
             reset_ledger(agent_id)
             log.info(
                 "code_audit.cached_reuse",
                 agent_id=agent_id,
                 diff_hash=diff_hash[:12],
                 verdict=verdict_cached,
+                source_attestation_id=cached_source[:8] or None,
             )
             return {
                 "audited": True,
                 "verdict": verdict_cached,
-                "lines_audited": 0,
+                "issues_count": len(cached_issues),
+                "top_issues": cached_issues[:_TOP_ISSUES_MAX],
+                "lines_audited": lines_now,
                 "attestation_id": attestation_id,
                 "cached_diff_hash": diff_hash[:12],
+                "cached_from_attestation_id": cached_source or None,
                 "message": (
                     "[code audit] 同一 diff 内容已有审计结论 "
                     f"{verdict_cached}，本次复用未重烧 LLM。若代码有新改动，"
@@ -872,7 +970,15 @@ async def run_code_audit(
                 ),
             }
 
-        system, user = build_audit_prompt(diff, task_id)
+        # 审计 epic P0-2：prompt 注入任务验收标准（取不到跳过该节）+
+        # 作者申诉（finding 级，仅参考）。
+        criteria = await load_task_acceptance_criteria(project_id, task_id)
+        system, user = build_audit_prompt(
+            diff,
+            task_id,
+            acceptance_criteria=criteria,
+            appeal_notes=appeal_notes,
+        )
         # P0-2：并发整形——多 agent 同时触发审计时排队（默认并发 2），
         # 避免全员直打上游网关在风暴期互相放大失败。
         async with _get_audit_gate():
@@ -886,6 +992,29 @@ async def run_code_audit(
             reason = str(meta.get("reason") or "")
             if reason in _SOFT_FAIL_ATTEMPT_REASONS:
                 record_audit_attempt(agent_id, reason, task_id)
+            # 审计 epic P1-4：上游暂态失败 → 平台自动入队后台重试并回填
+            # 通知，agent 等待即可，不必赌重试或直奔 waive。入队成功时在
+            # 返回 dict 附 retry_queued / retry_attempts / retry_exhausted
+            # （工具层改写回执文案）；入队失败（无 DB / 异常）保持原契约。
+            if reason == "llm_failed" and meta.get("audit_upstream_unavailable"):
+                queued: dict | None = None
+                try:
+                    from hiveweave.services.audit_retry import enqueue_failed_audit
+
+                    queued = await enqueue_failed_audit(
+                        project_id, agent_id, task_id, diff_hash,
+                        worktree=worktree, commit_hash=commit_hash,
+                        appeal_notes=appeal_notes,
+                    )
+                except Exception:  # noqa: BLE001 — 软失败契约，入队绝不 raise
+                    queued = None
+                if queued is not None:
+                    meta = dict(meta)
+                    meta["retry_queued"] = True
+                    meta["retry_attempts"] = queued.get("attempts")
+                    meta["retry_exhausted"] = bool(queued.get("exhausted"))
+                    # 审计 P2：耗尽后人工重试 → 新一轮重试序列（回执措辞用）
+                    meta["retry_resequence"] = bool(queued.get("resequence"))
             return meta
 
         verdict = _parse_verdict(text)
@@ -920,7 +1049,8 @@ async def run_code_audit(
             ),
         )
 
-        # 40 轮报告第 4 步：审计结论入缓存（同 agent + 同 diff 哈希复用）
+        # 40 轮报告第 4 步：审计结论入缓存（同 agent + 同 diff 哈希复用）。
+        # 审计 epic P0-1：同时落 issue 列表 + 原凭证 id，命中路径可回放。
         try:
             await attestation_service.audit_cache_store(
                 project_id,
@@ -929,6 +1059,8 @@ async def run_code_audit(
                 verdict=verdict,
                 exit_code=exit_code,
                 attestation_id=str(attestation_id),
+                top_issues=issues,
+                source_attestation_id=str(attestation_id),
             )
         except Exception:  # noqa: BLE001 — 缓存写入失败不影响审计主流程
             pass

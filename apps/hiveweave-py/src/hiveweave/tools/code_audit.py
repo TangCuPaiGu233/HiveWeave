@@ -36,6 +36,16 @@ class RequestCodeAuditParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["taskId", "task_id", "id"]},
     )
+    appeal_notes: str | None = Field(
+        default=None,
+        alias="appealNotes",
+        description=(
+            "作者申诉（可选）：你认为 diff 中某些行为是任务规格/验收标准"
+            "要求而非缺陷时，附规格原文与理由。仅参考——审计会独立核实，"
+            "不因申诉自动放行。"
+        ),
+        json_schema_extra={"aliases": ["appealNotes", "appeal_notes", "appeal"]},
+    )
 
 
 async def _resolve_task_id(project_id: str, agent_id: str) -> str | None:
@@ -61,15 +71,48 @@ async def _resolve_task_id(project_id: str, agent_id: str) -> str | None:
 
 
 def _format_verdict(result: dict) -> ToolResult:
-    """短契约：审计结论 / 行数 / top issues / 报告路径 / 凭证。"""
+    """短契约：审计结论 / 行数 / top issues / 报告路径 / 凭证。
+
+    审计 epic P0-1（42 轮报告）：缓存命中回执此前显示「ISSUES / 0 行 /
+    0 问题」自相矛盾，agent 误判审计空转后 12 次重审赌结果 + 一次误导性
+    豁免。现在缓存命中回放原 issue 列表 / 行数，并透出 message 与
+    「缓存复用自凭证 X」——cached ISSUES 回执绝不能再出现「0 行/0 问题」。
+    """
     lines = [
         f"审计结论: {result.get('verdict') or 'UNKNOWN'}",
         f"审计行数: {int(result.get('lines_audited') or 0)}",
     ]
     if result.get("verdict") == "ISSUES":
-        lines.append(f"问题数: {int(result.get('issues_count') or 0)}")
-        for i, issue in enumerate(result.get("top_issues") or [], 1):
-            lines.append(f"{i}. {issue}")
+        top = result.get("top_issues") or []
+        if top:
+            lines.append(f"问题数: {int(result.get('issues_count') or 0)}")
+            for i, issue in enumerate(top, 1):
+                lines.append(f"{i}. {issue}")
+        elif result.get("cached_from_attestation_id") or result.get(
+            "cached_diff_hash"
+        ):
+            # 审计 P1-2 修复：存量缓存行（升级前写入）top_issues 为 NULL，
+            # 回放时 ISSUES 结论配「问题数: 0」自相矛盾——改为明示明细缺失。
+            lines.append(
+                "存量缓存无问题明细（升级前写入），如需明细请改代码使 "
+                "diff 变化后重审"
+            )
+        else:
+            lines.append(f"问题数: {int(result.get('issues_count') or 0)}")
+        lines.append(
+            "申诉通道：某发现若实为任务规格/验收标准要求的行为（如规格指定"
+            "的默认 token），重新 request_code_audit 附 appealNotes（引用"
+            "规格原文）走 finding 级申诉，不必改代码迎合。"
+        )
+    cached_from = result.get("cached_from_attestation_id")
+    if cached_from:
+        lines.append(
+            f"缓存复用自凭证 {cached_from}：diff 未变，结论不变，"
+            "重审无意义（同一 diff 只会得到同一结论）。"
+        )
+    message = result.get("message")
+    if message:
+        lines.append(str(message))
     model_id = result.get("audit_model_id")
     source = result.get("audit_model_source")
     if model_id:
@@ -121,6 +164,7 @@ async def request_code_audit_tool(
             project_id, agent_id, task_id,
             call_llm=call_llm,
             oneshot_llm=oneshot_llm,
+            appeal_notes=(params.appeal_notes or "").strip() or None,
         )
     except Exception as e:
         log.warning("request_code_audit.crashed", agent_id=agent_id, error=repr(e))
@@ -128,14 +172,42 @@ async def request_code_audit_tool(
 
     if not result.get("audited"):
         reason = result.get("reason") or "unknown"
+        if reason == "llm_failed" and result.get("retry_queued"):
+            # 审计 epic P1-4：失败已入队后台自动重试——回执改为重试队列
+            # 口径，绝不再教 agent「反复失败就 waive」（42 轮实测 6/6
+            # waive 级联全由此文案引发）。
+            attempts = result.get("retry_attempts")
+            if result.get("retry_exhausted"):
+                return ToolResult.ok(
+                    f"审计未执行: {reason}. 审计上游失败，自动重试已达上限"
+                    f"（{attempts} 次）。平台不再自动重试——如确认上游长时间"
+                    "不可用，可请 coordinator 走 waive_attestation（真实"
+                    "人工决策）；否则稍后再重试 request_code_audit。"
+                )
+            if result.get("retry_resequence"):
+                # 审计 P2 修复：耗尽后再人工重试会新插 attempts=1 行，
+                # 措辞点明这是新一轮重试序列，与「平台不再自动重试」不打架。
+                return ToolResult.ok(
+                    f"审计未执行: {reason}. 此前的自动重试序列已耗尽；你本次"
+                    f"人工重试已作为新一轮重试序列（第 {attempts} 次）排队，"
+                    "成功后会通过收件箱通知你，无需申请豁免。"
+                )
+            return ToolResult.ok(
+                f"审计未执行: {reason}. 审计上游失败，平台已排队自动重试"
+                f"（第 {attempts} 次）；成功后会通过收件箱通知你，无需申请"
+                "豁免，也无需循环重试 request_code_audit。等待重试通知即可，"
+                "此期间不要提交（submit 门禁在审计凭证就绪前会拒绝）。"
+            )
         # s3-clone_06 P0-1/P0-3：fail-loud 之后"直接 submit"会被门禁拒——
         # 旧文案（soft gate — does not block）误导 Agent 走一条必然失败的路。
+        # 审计 epic P1-4：llm_failed 文案统一为重试队列口径（等待平台自动
+        # 重试通知；waive 只是多次自动重试仍失败后的真实人工决策出口）。
         return ToolResult.ok(
             f"审计未执行: {reason}. "
-            "Next: retry request_code_audit（审计对真实 diff 需 30-90s，"
-            "超时帽见 CODE_AUDIT_LLM_TIMEOUT_S）；若反复失败，submit_task "
-            "会被门禁拦下，需请 coordinator 走 "
-            "waive_attestation(taskId=..., reason=...) 并附上你已有的替代"
-            "证据（如 test_run）。"
+            "Next: retry request_code_audit once（审计对真实 diff 需 30-90s）。"
+            "llm_failed 属上游暂态时平台会自动排队重试并回填收件箱通知，"
+            "等待即可；只有多次自动重试仍失败才考虑请 coordinator 走 "
+            "waive_attestation(taskId=..., reason=...)（真实人工决策）。"
+            "审计凭证就绪前 submit_task 会被门禁拦下。"
         )
     return _format_verdict(result)

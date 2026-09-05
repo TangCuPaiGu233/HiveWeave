@@ -1715,8 +1715,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "CEO: look at ledger.scope for that task first; may omit "
             "evidenceAttestationId after looking at that task. "
             "Coordinators must cite a real test_run / browse_e2e / "
-            "visual_check / doc_review. Max 2 per task. Waiving agent "
-            "cannot later approve (unless small-team sole reviewer). "
+            "visual_check / doc_review. Max 2 per task. "
             "Must be CEO-only for VERIFY and docs_only tasks (coordinators: "
             "use attest_doc_review for docs). Never waive a verdict=FAIL "
             "conclusion — waiver covers MISSING attestation only, not a "
@@ -1761,6 +1760,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Read-only: busy/idle, disposition, unread_wake. Call this "
             "before claiming someone is busy or nagging a silence. "
             "Pass agentId (花名/short_id/UUID); omit to list the project."
+            "Pass reasonKind: tool_failure (tool/upstream failure such as "
+            "audit LLM transient outage — you KEEP your approval right) or "
+            "quality (real quality exemption — waiving agent cannot later "
+            "approve unless small-team sole reviewer). "
         ),
         "properties": {
             "agentId": {
@@ -1783,6 +1786,16 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "description": "花名, short_id, or UUID.",
             },
         },
+            "reasonKind": {
+                "type": "string",
+                "aliases": ["reason_kind", "kind"],
+                "description": (
+                    "quality (default, real quality exemption — you lose "
+                    "approval right) | tool_failure (tool/upstream failure "
+                    "such as audit LLM outage — you keep approval right). "
+                    "When unsure use quality."
+                ),
+            },
         "required": ["agentId"],
     },
     "get_platform_state": {
@@ -1934,9 +1947,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": (
             "One-shot LLM audit of your worktree diff. Required before "
             "submit_task when cumulative code edits exceed 20 lines. "
-            "Returns VERDICT PASS/ISSUES; ISSUES do not block submit. "
-            "Runs on a teammate's currently-used model when that model "
-            "differs from yours; otherwise your own model. One extra LLM call."
+            "Returns VERDICT PASS/ISSUES; only high-severity issues block "
+            "submit. The audit prompt includes the task's acceptance "
+            "criteria — spec-mandated behavior is not a defect. If the LLM "
+            "call fails (llm_failed) the platform auto-enqueues a background "
+            "retry and notifies you in your inbox when it succeeds; wait for "
+            "the notice instead of waive-hunting. Runs on a teammate's "
+            "currently-used model when that model differs from yours; "
+            "otherwise your own model. One extra LLM call."
         ),
         "properties": {
             "taskId": {
@@ -2004,6 +2022,16 @@ TOOL_PARAM_SCHEMAS["browse_main"] = {
 }
 TOOL_PARAM_SCHEMAS["game_run_case_main"] = {
     **TOOL_PARAM_SCHEMAS["game_run_case"],
+            "appealNotes": {
+                "type": "string",
+                "aliases": ["appeal_notes", "appeal"],
+                "description": (
+                    "Optional author appeal: if some diff behavior is "
+                    "required by the task spec / acceptance criteria (quote "
+                    "the spec text and why). Reference only — the audit "
+                    "verifies independently and never auto-passes on appeal."
+                ),
+            },
     "properties": dict(TOOL_PARAM_SCHEMAS["game_run_case"].get("properties") or {}),
     "description": (
         "Same as game_run_case, but Chromium cwd is the PROJECT ROOT. Use "

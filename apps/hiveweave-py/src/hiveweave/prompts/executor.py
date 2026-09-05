@@ -122,8 +122,8 @@ def _test_engineer_script(name: str) -> str:
 - **specs 一致性（MANDATORY）**：验收前先读 `docs/` 规格（如有）。实现的依赖清单、API 契约、数据模型与 specs 不符 → 直接判 fail（或上报上级确认 specs 已变更），不得"能跑就过"
 - **CODE AUDIT DISCIPLINE**: if your cumulative test/script code edits exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE submit_task to audit your worktree diff (teammate's currently-used model when it differs from yours). Call it EARLY in the turn — 一次 LLM 调用、耗时 30–90s（硬顶 90s），**不要重试成循环**。
   **审计软失败 ≠ 可以提交**（2026-09-01 起语义变更，旧提示"soft-fail is acceptable"已作废）：`llm_failed` / `no_model` / `no_callback` / `no_worktree` 之后 `submit_task` **必被门禁拒绝**。按序走：
-  1) 重试一次 `request_code_audit`（上游抖动居多，第二次通常过）；
-  2) 仍失败 → 照常 `submit_task` 并附你已有的替代证据（`test_run:<凭证id>`），**同时** `send_message(recipients=["<上级花名>"])` 请他对这条任务 `waive_attestation(taskId=..., reason=...)`；
+  1) 重试一次 `request_code_audit`（配置类失败当场可见；`llm_failed` 属上游暂态，平台会自动排队后台重试并通过收件箱通知你结果）；
+  2) `llm_failed` → 等平台的自动重试通知即可，**无需申请豁免**；只有多次自动重试（5 次）仍失败时才考虑请上级 `waive_attestation(taskId=..., reason=...)`（真实人工决策）；
   3) 不要闷头重复 submit —— 只会反复被拒，表现为"提交后任务纹丝不动"。
 - 测试金字塔：单元/集成/E2E = 80/15/5，但有 UI 时 E2E 不可为 0
 
@@ -465,8 +465,8 @@ timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检�
 ## 执行纪律（不可违反）
 - **CODE AUDIT DISCIPLINE（MANDATORY）**: if your cumulative code edits this task exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE submit_task to get a second-pass audit of your worktree diff (one-shot sub-call on a teammate's currently-used model when it differs from yours; otherwise your own). Call it EARLY in the turn —— 一次 LLM 调用、耗时 30–90s（硬顶 90s），不要重试成循环。
   **审计软失败 ≠ 可以提交**（2026-09-01 起语义变更，旧提示"soft-fails are acceptable"已作废）：`no_worktree` / `no_callback` / `no_model` / `llm_failed` 之后 `submit_task` **必被门禁拒绝**。按序走：
-  1) 重试一次 `request_code_audit`（上游抖动居多，第二次通常过）；
-  2) 仍失败 → 照常 `submit_task` 并附替代证据（`test_run:<凭证id>`），**同时** `send_message(recipients=["<上级花名>"])` 请他对这条任务执行 `waive_attestation(taskId=..., reason=...)`；
+  1) 重试一次 `request_code_audit`（配置类失败当场可见；`llm_failed` 属上游暂态，平台会自动排队后台重试并通过收件箱通知你结果）；
+  2) `llm_failed` → 等平台的自动重试通知即可，**无需申请豁免**；只有多次自动重试（5 次）仍失败时才考虑请上级执行 `waive_attestation(taskId=..., reason=...)`（真实人工决策）；
   3) 不要闷头重复 submit —— 只会反复被拒（表现为"提交了但任务纹丝不动"），那是门禁在工作，不是平台卡住。
 - **提交前自审 — self-review（MANDATORY）**：在所有代码改动提交给上级之前，先用 `read_skill("self-review")` 加载自审方法论，对代码做五轴自查（正确性/可读性/架构/安全/性能）。发现问题当场修。自审通过后再提交。
 - **按 submitGate 自证（不是全站验收）**：`unit` → 模块/单测（`bash(..., taskId=本任务)`）；`module_visual` → 本模块 browse（截图进对话）。长视觉循环用 `spawn_subagent` + `commit_turn(waiting)`，不要把全站 E2E 嵌进本轮。`docs` / `code_audit` 跟对应工具。整体/里程碑测试是 QA 在 MAIN 的事，不要自己顶。若收到本任务 `[TASK] Attestation gate waived`，可 `submit_task` 不附 attestationIds。

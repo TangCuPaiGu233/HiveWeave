@@ -70,6 +70,18 @@ class WaiveAttestationParams(BaseModel):
         description="Why this task is exempt (e.g. 'CLI 任务无 UI 可 browse，"
         "以 bash 验证日志替代'). Required for auditability.",
     )
+    reason_kind: str = Field(
+        default="quality",
+        alias="reasonKind",
+        description=(
+            "豁免原因类（审计 epic P0-3）：tool_failure = 工具/上游失败类"
+            "（如审计 LLM 暂态不可用、平台故障）——不影响你（发起人）的"
+            "审批权；quality = 真实质量类豁免（凭证缺失但质量可接受）——"
+            "发起人失审批权（第三方隔离，小团队唯一 REVIEW holder 例外）。"
+            "拿不准就填 quality（默认收紧）。"
+        ),
+        json_schema_extra={"aliases": ["reasonKind", "reason_kind", "kind"]},
+    )
     evidence_attestation_id: str = Field(
         default="",
         alias="evidenceAttestationId",
@@ -107,12 +119,15 @@ async def _agent_has_open_verify(project_id: str, agent_id: str) -> bool:
     "waive_attestation",
     "Waive the attestation gate for ONE task (coordinator/CEO). "
     "Always pass a single taskId — never all tasks. "
+    "Pass reasonKind: tool_failure (tool/upstream failure such as audit LLM "
+    "transient outage — you KEEP your approval right) or quality (real "
+    "quality exemption — waiving agent CANNOT later approve, third-party "
+    "isolation; small-team sole REVIEW holder exempt). "
     "CEO may omit evidenceAttestationId after looking at that task "
     "(browse then waive this id; that is how 'no QA hire' is recorded). "
     "Coordinators must cite evidenceAttestationId "
     "(test_run/browse_e2e/visual_check/doc_review). "
-    "Max 2 waivers per task. The waiving agent CANNOT later approve "
-    "the same task (third-party isolation) unless small-team sole reviewer. "
+    "Max 2 waivers per task. "
     "VERIFY waive is CEO-only. Prefer attest_doc_review for document "
     "VERIFY unless CEO waives that one task. "
     "Never waive a verdict=FAIL conclusion — waiver covers MISSING attestation "
@@ -221,12 +236,18 @@ async def waive_attestation_tool(
         )
     if await has_valid_waiver(project_id, params.task_id):
         waived_by = agent_id
+        existing_kind = "quality"
         try:
-            from hiveweave.services.attestation import get_valid_waiver
+            from hiveweave.services.attestation import (
+                get_valid_waiver,
+                normalize_waiver_kind,
+            )
 
             wr = await get_valid_waiver(project_id, params.task_id)
             if wr and wr.get("agent_id"):
                 waived_by = str(wr["agent_id"])
+            if wr:
+                existing_kind = normalize_waiver_kind(wr.get("waiver_kind"))
         except Exception:
             pass
         tip = await _format_post_waive_approve_tip(
@@ -234,11 +255,25 @@ async def waive_attestation_tool(
             waived_by=waived_by,
             assignee_id=str(task.get("assignee_id") or "") or None,
             caller_id=agent_id,
+            kind=existing_kind,
         )
+        # 审计 P2 修复：措辞按既有 waiver 的 kind 分流——旧实现硬编码
+        # "quality-class waived_by cannot approve"，对 tool_failure 豁免
+        # 误导发起人「自己不能批」。
+        if existing_kind == "tool_failure":
+            reject_detail = (
+                "Wait for expiry, or approve yourself — this is a "
+                "tool_failure waiver: it does NOT take away your approval "
+                "right."
+            )
+        else:
+            reject_detail = (
+                "Wait for expiry or approve via a different agent "
+                "(quality-class waived_by cannot approve)."
+            )
         return ToolResult.err(
             f"waive_attestation rejected: task {params.task_id} already has "
-            "an unexpired waiver. Wait for expiry or approve via a different "
-            "agent (waived_by cannot approve)."
+            f"an unexpired waiver (kind={existing_kind}). {reject_detail}"
             + tip
         )
 
@@ -335,12 +370,17 @@ async def waive_attestation_tool(
         if evidence_id
         else f"[ceo_look] {reason}"
     )
+    # 审计 epic P0-3：waiver 按原因分流（quality 默认 | tool_failure）。
+    from hiveweave.services.attestation import normalize_waiver_kind
+
+    waiver_kind = normalize_waiver_kind(params.reason_kind)
     try:
         waiver_id = await create_waiver(
             project_id,
             task_id=params.task_id,
             waived_by=agent_id,
             reason=stored_reason,
+            kind=waiver_kind,
         )
     except Exception as e:
         return ToolResult.err(f"Failed to create waiver: {e}")
@@ -395,6 +435,20 @@ async def waive_attestation_tool(
         waived_by=agent_id,
         reason=reason[:120],
         is_verify=is_verify,
+        waiver_kind=waiver_kind,
+    )
+
+    # 审批自动路由（审计 epic P0-3）：豁免生效后直接把审批请求转给可审批
+    # 者（QA 优先），不再让 agent 自己猜谁能批（42 轮实测 6/6 waive 因
+    # 「发起人失审批权 × CEO 不审叶子 × 单 QA」级联死锁）。
+    routed_name, route_note = await _route_waive_approval(
+        project_id,
+        task_title=str(task.get("title") or "")[:60],
+        task_id=str(task.get("id") or params.task_id),
+        waived_by=agent_id,
+        assignee_id=str(assignee) if assignee else None,
+        kind=waiver_kind,
+        waiver_id=waiver_id,
     )
 
     # TEST18 NEW-9: do not make the AI guess who can approve — list them.
@@ -402,13 +456,22 @@ async def waive_attestation_tool(
         project_id,
         waived_by=agent_id,
         assignee_id=str(assignee) if assignee else None,
+        kind=waiver_kind,
     )
 
+    kind_line = (
+        " 工具失败类豁免（tool_failure）不影响你的审批权。"
+        if waiver_kind == "tool_failure"
+        else " 质量类豁免（quality）：你（发起人）失审批权，由第三方审批。"
+    )
+    # 审计 P2 修复：路由播报只在 route_note 一处（旧实现 routed_line 与
+    # route_note 重复播报「审批请求已转给 X」两遍）。
     return ToolResult.ok(
         f"Attestation waived for task {params.task_id} "
-        f"(waiver {waiver_id[:8]}, expires in 24h).\n"
+        f"(waiver {waiver_id[:8]}, kind={waiver_kind}, expires in 24h).\n"
         f"Stored reason (quote this in reports): {reason}\n"
         f"Assignee may now submit_task without attestationIds."
+        + kind_line
         + (
             " CEO look-waiver: this task only — other tasks keep their gates."
             if ceo_override and not evidence_id
@@ -419,8 +482,111 @@ async def waive_attestation_tool(
             if is_verify
             else ""
         )
+        + route_note
         + next_tip
     )
+
+
+async def _is_qa_role_agent(org: Any, agent_id: str) -> bool:
+    """True when agent row looks like a QA / test engineer（路由 QA 优先）。"""
+    try:
+        row = await org.get_agent(agent_id)
+    except Exception:
+        return False
+    role = str((row or {}).get("role") or "")
+    role_l = role.strip().lower()
+    if role_l in ("qa", "qa_engineer", "qa engineer", "test_engineer"):
+        return True
+    return "测试" in role or "test" in role_l
+
+
+async def _route_waive_approval(
+    project_id: str,
+    *,
+    task_title: str,
+    task_id: str,
+    waived_by: str,
+    assignee_id: str | None,
+    kind: str,
+    waiver_id: str,
+) -> tuple[str | None, str]:
+    """审批自动路由（审计 epic P0-3）。返回 (被路由者显示名, 回执附注)。
+
+    按既有排除规则算可审批者（list_review_capable_agent_ids）：
+      - assignee 恒被排除（自审硬门必拒，不能把审批请求 wake 给承办人本人
+        ——审计 P1-1 修复）；
+      - waived_by：quality 类排除（第三方隔离）；tool_failure 不排除
+        （发起人保留审批权）。
+    取第一个（QA 优先）发收件箱通知（wake=1、trusted_platform、
+    idempotency_key=waive_route:{task_id}:{waiver_id}）。
+    小团队唯一 REVIEW holder 自批豁免逻辑保持（_format_post_waive_approve_tip
+    内 is_small_team_sole_reviewer 判定不变）。
+    """
+    from hiveweave.services.org import OrgService
+    from hiveweave.services.unblock_soft import list_review_capable_agent_ids
+
+    excl: set[str] = set()
+    if assignee_id:
+        excl.add(str(assignee_id))  # 恒排除：承办人不可自审
+    if kind != "tool_failure":
+        excl.add(str(waived_by))    # quality：第三方隔离
+    try:
+        holders = await list_review_capable_agent_ids(
+            project_id, exclude_ids=excl
+        )
+    except Exception:
+        holders = None
+    if not holders:
+        # 名册不可读（None）或无人可批（[]）→ 不路由，tip 里有死锁出路
+        return None, ""
+
+    org = OrgService()
+    candidates = [h for h in holders if h != str(waived_by)]
+    if candidates:
+        qa_first = [h for h in candidates if await _is_qa_role_agent(org, h)]
+        ordered = qa_first + [h for h in candidates if h not in qa_first]
+        target = ordered[0]
+        row = None
+        try:
+            row = await org.get_agent(target)
+        except Exception:
+            row = None
+        display = (row or {}).get("name") or target[:8]
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().send_message(
+                from_agent_id=waived_by,
+                to_agent_id=target,
+                message=(
+                    f"[TASK] 任务 '{task_title}' ({task_id}) 已豁免"
+                    f"（{kind}），请你审批：review_task(decision=\"approve\")。"
+                    "waived 路径跳过审查方 attestation 校验。"
+                ),
+                message_type="task",
+                priority="normal",
+                task_id=task_id,
+                wake=True,
+                trusted_platform=True,
+                idempotency_key=f"waive_route:{task_id}:{waiver_id}",
+            )
+        except Exception as e:
+            log.warning("waive_route_notify_failed", error=str(e))
+            return None, ""
+        return display, (
+            f"\n审批请求已自动转给 {display}（收件箱通知已发，wake=1）。"
+        )
+
+    # 除发起人外无人可批：
+    #   tool_failure → 发起人保留审批权，可直接自批（不发通知打扰别人）
+    if kind == "tool_failure":
+        return None, (
+            "\n除你之外没有其他在岗 REVIEW holder——工具失败类豁免不影响"
+            "你的审批权，你可直接 review_task(decision=\"approve\") 自批"
+            "（真实人工决策，已留审计痕迹）。"
+        )
+    #   quality → 维持现状：tip 的 sole-reviewer / 死锁出路接管
+    return None, ""
 
 
 async def _format_post_waive_approve_tip(
@@ -429,6 +595,7 @@ async def _format_post_waive_approve_tip(
     waived_by: str,
     assignee_id: str | None,
     caller_id: str | None = None,
+    kind: str = "quality",
 ) -> str:
     """Concrete NEXT ACTION after waive — name people, do not say '找人'.
 
@@ -439,6 +606,10 @@ async def _format_post_waive_approve_tip(
     等于让他 ask 自己，死锁于此。现在 caller 在名单内时直接告知：
     你就是合法第三方 approver，立即 review_task(approve)，无需新 waiver、
     无需自跑测试（waived 路径跳过审查方 attestation 校验）。
+
+    审计 epic P0-3：kind=tool_failure 时发起人**保留**审批权（不进
+    excl），回执明说「工具失败类豁免不影响你的审批权」；quality 维持
+    连坐（42 轮实测 6/6 waive 因发起人失审批权级联死锁）。
     """
     from hiveweave.services.org import OrgService
     from hiveweave.services.unblock_soft import (
@@ -446,7 +617,11 @@ async def _format_post_waive_approve_tip(
         list_review_capable_agent_ids,
     )
 
-    # Small-team sole REVIEW holder may self-approve their own waiver.
+    tool_failure = kind == "tool_failure"
+
+    # Small-team sole REVIEW holder may self-approve their own waiver
+    #（quality 类保持原连坐例外；tool_failure 发起人本就保留审批权，
+    # 不需要该豁免，但保留判定无害）。
     try:
         sole = await is_small_team_sole_reviewer(
             project_id,
@@ -463,6 +638,42 @@ async def _format_post_waive_approve_tip(
             "Do NOT invent a fake rework to escape."
         )
 
+    if tool_failure:
+        # 工具失败类：发起人保留审批权——不进排除名单
+        holders = await list_review_capable_agent_ids(
+            project_id, exclude_ids={str(assignee_id)} if assignee_id else set()
+        )
+        if holders is None:
+            return (
+                "\n\nNEXT ACTION: 工具失败类豁免不影响你的审批权"
+                "（tool_failure 不失审批权）。Org roster unreadable right "
+                "now — retry, then approve yourself or ask another REVIEW "
+                "holder. Do NOT invent a fake rework."
+            )
+        if str(waived_by) in {str(h) for h in holders}:
+            return (
+                "\n\nNEXT ACTION: 工具失败类豁免不影响你的审批权"
+                "（tool_failure 不失审批权）——你可直接 review_task"
+                "(decision=\"approve\") 自批本次豁免（真实人工决策，"
+                "已留审计痕迹）。Do NOT invent a fake rework."
+            )
+        lines: list[str] = [
+            "\n\nNEXT ACTION: 工具失败类豁免不影响你的审批权，但你当前"
+            "不在在岗 REVIEW 名单（角色受限？）。可审批者：",
+        ]
+        org = OrgService()
+        for hid in holders[:8]:
+            row = None
+            try:
+                row = await org.get_agent(hid)
+            except Exception:
+                row = None
+            name = (row or {}).get("name") or hid[:8]
+            short = (row or {}).get("short_id") or "?"
+            lines.append(f"  - {name} ({short}) id={hid}")
+        return "\n".join(lines)
+
+    # quality：维持第三方隔离（waived_by 不可批）
     excl: set[str] = {str(waived_by)}
     if assignee_id:
         excl.add(str(assignee_id))
@@ -498,7 +709,7 @@ async def _format_post_waive_approve_tip(
         )
 
     org = OrgService()
-    lines: list[str] = [
+    lines = [
         "\n\nNEXT ACTION: You CANNOT approve this task yourself "
         "(waived_by third-party rule). Ask ONE of these REVIEW holders "
         "to review_task(approve) — do NOT invent a fake rework:",

@@ -484,10 +484,10 @@ that docs slice first, or paste / `artifact_refs` — empty MAIN is OK until the
   `git_worktree_checkpoint` → `submit_task` → **上级（CEO）review** →
   异人 approve 后你才能 `git_worktree_merge` 自己的分支。
 - **CODE AUDIT DISCIPLINE**: when you write code yourself and your cumulative edits exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE your own submit_task to get a second-pass audit of your worktree diff (teammate's currently-used model when it differs from yours). Call it EARLY in the turn — it is ONE LLM call that takes 30–90s (hard cap 90s); do not retry-loop it.
-  **审计软失败 ≠ 可以提交**（2026-09-01 起语义变更，旧提示"soft-fail is acceptable"已作废）：`llm_failed` / `no_model` / `no_callback` / `no_worktree` 之后 `submit_task` **会被门禁拒绝**。三条出路，按序：
-  1) 重试一次 `request_code_audit`（多数是上游抖动，第二次就过）；
-  2) 仍失败 → 带上你已有的替代证据（`test_run:<凭证id>`）继续提交，但**必须同时** `send_message` 给你的上级/Coordinator，请他对这条任务执行 `waive_attestation(taskId=..., reason=...)`；
-  3) 你自己是 Coordinator 时，可在核验叶子的替代证据后直接 `waive_attestation`（**一次只能关一条任务**，禁止 all/列表）。
+  **审计软失败 ≠ 可以提交**（2026-09-01 起语义变更，旧提示"soft-fail is acceptable"已作废）：`llm_failed` / `no_model` / `no_callback` / `no_worktree` 之后 `submit_task` **会被门禁拒绝**。按序走：
+  1) 重试一次 `request_code_audit`（配置类失败当场可见；`llm_failed` 属上游暂态，平台会自动排队后台重试并回填收件箱通知）；
+  2) `llm_failed` → 等平台的自动重试通知即可，**无需申请豁免**；只有多次自动重试（5 次）仍失败时才考虑 `waive_attestation`（真实人工决策；工具/上游失败类填 reasonKind=tool_failure，不影响你的审批权）；
+  3) 你自己是 Coordinator 时，多次自动重试仍失败可在核验叶子的替代证据后直接 `waive_attestation`（**一次只能关一条任务**，禁止 all/列表；上游失败类建议 reasonKind=tool_failure）。
   闷头重复 submit 只会反复被拒。当前项目若处于无人值守模式，等待审批类操作会被**秒拒**，别把回合耗在等上。
 - **禁止自审**：review_task 不能批自己 assignee 的任务；自交会自动上报上级。
 - 派给下级的活：dispatch 会自动建/钉下级 worktree；review 时下级树必须在那。

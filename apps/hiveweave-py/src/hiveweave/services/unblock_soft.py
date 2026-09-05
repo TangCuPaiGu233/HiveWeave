@@ -111,6 +111,7 @@ async def no_lawful_approver(
         )
 
     waived_by = ""
+    waiver_kind = "quality"
     if waiver_row:
         waived_by = str(waiver_row.get("agent_id") or "")
     elif task.get("id"):
@@ -123,8 +124,23 @@ async def no_lawful_approver(
                 waiver_row = wr
         except Exception:
             pass
+    if waiver_row:
+        # 审计 epic P0-3：waiver 按原因分流——tool_failure 发起人保留审批权
+        try:
+            from hiveweave.services.attestation import normalize_waiver_kind
+
+            waiver_kind = normalize_waiver_kind(waiver_row.get("waiver_kind"))
+        except Exception:
+            waiver_kind = "quality"
 
     if waived_by:
+        # 审计 epic P0-1 修复（审计代理）：tool_failure 豁免不影响发起人的
+        # 审批权——waived_by 不进排除集，审批路径不因此构成死锁。
+        # TODO(review 侧配套，另一代理负责): tools/tasks/review.py 的自批
+        # 硬门（waived_by 第三方隔离检查）须按同一 normalize_waiver_kind
+        # 口径放行 tool_failure 的 waived_by——两处语义必须一致。
+        if waiver_kind == "tool_failure":
+            return None
         # Small-team sole reviewer may self-approve their own waiver (S2).
         sole_ok = False
         if waived_by in holders:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import time
 import uuid
 from typing import Any
@@ -245,7 +246,8 @@ CREATE TABLE IF NOT EXISTS tool_attestations (
     console_errors INTEGER,
     created_at INTEGER NOT NULL,
     expires_at INTEGER,
-    project_id TEXT NOT NULL
+    project_id TEXT NOT NULL,
+    waiver_kind TEXT
 )
 """
 
@@ -260,9 +262,30 @@ CREATE TABLE IF NOT EXISTS audit_cache (
     exit_code INTEGER NOT NULL,
     attestation_id TEXT NOT NULL,
     created_at INTEGER NOT NULL,
+    top_issues TEXT,
+    source_attestation_id TEXT,
     PRIMARY KEY (agent_id, diff_hash)
 )
 """
+
+# 审计 epic P0-1（42 轮报告）：缓存命中要能**回放原结论**——旧表只存
+# verdict/exit_code，回执出现「ISSUES / 0 行 / 0 问题」自相矛盾，agent 误判
+# 审计空转后盲目重审。补两列：
+#   top_issues           — JSON 数组，原审计的 issue 行列表（复用时回放）
+#   source_attestation_id — 原始审计凭证 id（回执明示「缓存复用自凭证 X」）
+# 上面的 CREATE 已带全部新列（新库一步到位）；此处 ALTER 只服务存量库，
+# 跟随仓库 ALTER 判存模式（列已存在时 ALTER 报错被吞，幂等）。
+# 注意：新列必须同时进 CREATE 与本清单——跨测试共享 project id 时
+# ensure_schema 的 _migrated 标记会跳过 ALTER，全新 tempdir 库若 CREATE
+# 缺列会在 INSERT 时炸 "no column"（test_delivery_contract 实测）。
+_ATTESTATION_COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
+    # (table, column, column_def)
+    ("audit_cache", "top_issues", "TEXT"),
+    ("audit_cache", "source_attestation_id", "TEXT"),
+    # 审计 epic P0-3：waiver 按原因分流（quality | tool_failure）。
+    # tool_failure 豁免不影响发起人的审批权（42 轮实测 6/6 waive 全级联）。
+    ("tool_attestations", "waiver_kind", "TEXT"),
+]
 
 # npm test, pytest, vitest, yarn/pnpm test, go test, cargo test, etc.
 # 以及 CLI 脚本验证（井字棋实测暴露的盲区）：
@@ -515,7 +538,37 @@ class AttestationService:
             await execute_by_project(project_id, CREATE_AUDIT_CACHE_SQL)
         except Exception:
             pass
-        _migrated.add(project_id)
+        # 列级迁移（审计 P1-3 修复）：只吞 duplicate-column（幂等判存）；
+        # 其他异常（锁/IO）不落 _migrated——进程内下次调用重试，且不向上抛
+        # （沿用本函数外层容错语义）。旧行为 except Exception: pass + 无条件
+        # 标记迁移，会让首次锁失败后 waiver_kind 写入/查询持续炸。
+        migration_pending = False
+        for table, column, col_def in _ATTESTATION_COLUMN_MIGRATIONS:
+            try:
+                await execute_by_project(
+                    project_id,
+                    f"ALTER TABLE {table} ADD COLUMN {column} {col_def}",
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" in str(exc).lower():
+                    continue  # 列已存在 — 正常幂等路径
+                migration_pending = True
+                log.warning(
+                    "attestation_column_migration_failed",
+                    table=table,
+                    column=column,
+                    error=str(exc),
+                )
+            except Exception as exc:  # noqa: BLE001 — 非 OperationalError 同样重试
+                migration_pending = True
+                log.warning(
+                    "attestation_column_migration_failed",
+                    table=table,
+                    column=column,
+                    error=str(exc),
+                )
+        if not migration_pending:
+            _migrated.add(project_id)
 
     async def audit_cache_lookup(
         self, project_id: str, *, agent_id: str, diff_hash: str
@@ -524,10 +577,13 @@ class AttestationService:
 
         被审内容 = worktree diff（含未提交改动），diff 哈希相同即被审内容
         相同。Fail-open：任何失败返回 None（退化为正常 LLM 审计）。
+        审计 epic P0-1：同时返回 top_issues（JSON 数组）与
+        source_attestation_id（原审计凭证），供命中路径回放原结论。
         """
         dh = str(diff_hash or "").strip()
         if not dh or not agent_id:
             return None
+        await self.ensure_schema(project_id)
         try:
             conn = await _conn(project_id)
         except ProjectDbError:
@@ -536,7 +592,8 @@ class AttestationService:
             return None
         try:
             cur = await conn.execute(
-                "SELECT verdict, exit_code, attestation_id, created_at "
+                "SELECT verdict, exit_code, attestation_id, created_at, "
+                "top_issues, source_attestation_id "
                 "FROM audit_cache WHERE agent_id = ? AND diff_hash = ? "
                 "ORDER BY created_at DESC LIMIT 1",
                 [agent_id, dh],
@@ -556,11 +613,18 @@ class AttestationService:
         verdict: str,
         exit_code: int,
         attestation_id: str,
+        top_issues: list[str] | None = None,
+        source_attestation_id: str | None = None,
     ) -> None:
-        """写入审计缓存（best-effort，失败不影响审计主流程）。"""
+        """写入审计缓存（best-effort，失败不影响审计主流程）。
+
+        ``top_issues`` 以 JSON 数组落库（原审计 issue 行，复用时回放）；
+        ``source_attestation_id`` 记录结论的原始凭证，回执可溯源。
+        """
         dh = str(diff_hash or "").strip()
         if not dh or not agent_id:
             return
+        await self.ensure_schema(project_id)
         try:
             conn = await _conn(project_id)
         except ProjectDbError:
@@ -571,7 +635,8 @@ class AttestationService:
             await conn.execute(
                 "INSERT OR REPLACE INTO audit_cache "
                 "(agent_id, diff_hash, verdict, exit_code, attestation_id, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "created_at, top_issues, source_attestation_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     agent_id,
                     dh,
@@ -579,6 +644,12 @@ class AttestationService:
                     int(exit_code),
                     str(attestation_id),
                     int(time.time() * 1000),
+                    (
+                        json.dumps(list(top_issues), ensure_ascii=False)
+                        if top_issues is not None
+                        else None
+                    ),
+                    str(source_attestation_id) if source_attestation_id else None,
                 ],
             )
             await conn.commit()
@@ -604,6 +675,9 @@ class AttestationService:
         ttl_ms: int | None = None,
         # alias kept for callers that still pass commit=
         commit: str | None = None,
+        # waiver 原因分流（审计 epic P0-3）：quality | tool_failure，
+        # 仅 WAIVER_KIND 行使用；None = 历史 quality 语义。
+        waiver_kind: str | None = None,
     ) -> str:
         await self.ensure_schema(project_id)
         now = int(time.time() * 1000)
@@ -657,8 +731,8 @@ class AttestationService:
             "INSERT INTO tool_attestations "
             "(id, tool_call_id, task_id, agent_id, kind, command_or_url, "
             "exit_code, workspace, commit_hash, stdout_hash, artifact_hashes, "
-            "console_errors, created_at, expires_at, project_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "console_errors, created_at, expires_at, project_id, waiver_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 att_id,
                 tool_call_id or str(uuid.uuid4()),
@@ -675,6 +749,7 @@ class AttestationService:
                 now,
                 now + max_age,
                 project_id,
+                waiver_kind,
             ],
         )
         log.info(
@@ -683,6 +758,7 @@ class AttestationService:
             kind=kind,
             agent_id=agent_id,
             task_id=task_id,
+            waiver_kind=waiver_kind,
         )
         return att_id
 
@@ -780,8 +856,8 @@ class AttestationService:
                     return (
                         False,
                         f"Attestation agent mismatch: {aid} "
-                        f"(expected {expected_agent_id[:8]}, "
-                        f"got {str(row.get('agent_id') or '')[:8]})",
+                        f"(expected {expected_agent_id}, "
+                        f"got {row.get('agent_id') or ''})",
                     )
             kind = row.get("kind") or ""
             if kinds_ok is not None and kind not in kinds_ok:
@@ -946,6 +1022,24 @@ def screenshot_path_from_artifact_hashes(
 # 保留硬闸门的防假装完成功能，同时给 CLI/脚本类任务一个留痕出口。
 
 WAIVER_KIND = "waiver"
+# 审计 epic P0-3：waiver 按原因分流。
+WAIVER_KIND_QUALITY = "quality"          # 真实质量类豁免（默认）
+WAIVER_KIND_TOOL_FAILURE = "tool_failure"  # 工具/上游失败类豁免
+
+
+def normalize_waiver_kind(raw: str | None) -> str:
+    """waiver 原因类归一化：仅精确 "tool_failure" 归 tool_failure，余归 quality。
+
+    历史行 / 未知值一律按 quality（旧连坐语义）处理——分流只放行显式声明的
+    工具失败类，默认收紧。
+    """
+    return (
+        WAIVER_KIND_TOOL_FAILURE
+        if str(raw or "").strip() == WAIVER_KIND_TOOL_FAILURE
+        else WAIVER_KIND_QUALITY
+    )
+
+
 DOC_REVIEW_KIND = "doc_review"
 # Pixel-grounded UI assertion (assert_visual). Path-only screenshots do not count.
 VISUAL_CHECK_KIND = "visual_check"
@@ -1093,11 +1187,19 @@ async def create_waiver(
     waived_by: str,
     reason: str,
     ttl_ms: int | None = None,
+    kind: str = "quality",
 ) -> str:
-    """Coordinator 豁免某任务的 attestation 门禁。返回 waiver attestation id。"""
+    """Coordinator 豁免某任务的 attestation 门禁。返回 waiver attestation id。
+
+    ``kind`` 按原因分流（审计 epic P0-3）：
+      - "quality"（默认）：真实质量类豁免——发起人失审批权（第三方隔离）。
+      - "tool_failure"：工具/上游失败类豁免（如审计 LLM 暂态不可用）——
+        发起人**保留**审批权（waive.py 按此分流排除名单）。
+    """
     reason = (reason or "").strip()
     if not reason:
         raise ValueError("waiver reason is required (auditability)")
+    kind_norm = normalize_waiver_kind(kind)
     return await attestation_service.create(
         project_id,
         agent_id=waived_by,
@@ -1106,6 +1208,7 @@ async def create_waiver(
         command_or_url=f"waive_attestation: {reason[:450]}",
         stdout=reason,  # 只存 hash，作为审计指纹
         ttl_ms=ttl_ms,
+        waiver_kind=kind_norm,
     )
 
 
@@ -1131,7 +1234,7 @@ async def get_valid_waiver(
     now = int(time.time() * 1000)
     cur = await conn.execute(
         "SELECT id, agent_id, task_id, kind, created_at, expires_at, "
-        "command_or_url, stdout_hash "
+        "command_or_url, stdout_hash, waiver_kind "
         "FROM tool_attestations "
         "WHERE project_id = ? AND task_id = ? AND kind = ? "
         "AND (expires_at IS NULL OR expires_at > ?) "
@@ -1658,7 +1761,7 @@ def format_attestation_mismatch_hint(
     ]
     for h in held[:6]:
         bound = h.get("task_id") or "(unbound)"
-        hid = str(h.get("id") or "")[:8]
+        hid = str(h.get("id") or "")
         kind = h.get("kind") or "?"
         match = (
             "MATCH"
@@ -1666,10 +1769,11 @@ def format_attestation_mismatch_hint(
             else "mismatch"
         )
         lines.append(
-            f"  - {kind} id={hid}… bound_task={str(bound)[:8]} ({match})"
+            f"  - {kind} id={hid} bound_task={bound} ({match}) "
+            "(full ids — copy directly)"
         )
     lines.append(
-        f"Target task={str(target_task_id)[:8]}… — consume assignee evidence "
+        f"Target task={target_task_id} — consume assignee evidence "
         f"on this task, or review_task(rework) for the leaf to attach the "
         f"submitGate kinds. Do not re-run tests yourself to unlock approve."
     )

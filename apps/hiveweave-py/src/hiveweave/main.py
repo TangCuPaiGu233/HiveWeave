@@ -833,6 +833,14 @@ async def lifespan(app: FastAPI):
 
         _asyncio.create_task(_task())
 
+    # 6b. 审计 epic P1-4：审计上游暂态失败的后台重试循环（llm_failed 入队，
+    # 60s 扫到期 pending，成功/作废/耗尽均收件箱回填通知）。
+    try:
+        from hiveweave.services.audit_retry import audit_retry_loop
+        audit_retry_loop.start()
+    except Exception as e:
+        log.warning("audit_retry_loop_start_failed", error=str(e))
+
     _spawn_legacy_stash_scan()
     log.info("app_started")
 
@@ -858,6 +866,13 @@ async def lifespan(app: FastAPI):
     log.info("game_time_stopped")
 
     # Reap native off-turn jobs before stopping agents so completion
+    # Stop audit retry loop first (cheap, no in-flight LLM dependency)
+    try:
+        from hiveweave.services.audit_retry import audit_retry_loop
+        audit_retry_loop.stop()
+    except Exception:
+        pass
+
     # cannot trigger_subordinate and revive a stopped agent.
     try:
         from hiveweave.services.offturn import reap_all_offturn_jobs

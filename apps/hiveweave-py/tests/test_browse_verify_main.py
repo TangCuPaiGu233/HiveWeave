@@ -56,7 +56,11 @@ async def test_browse_stays_on_worktree_even_for_verify(tmp_path):
             workspace=str(wt),
         )
 
-    assert seen == [str(wt), str(wt)]
+    # goto/viewport/console 捕获等全部 CLI 调用都必须落在 worktree 上，
+    # 任何一次都不允许被静默改写到 MAIN（console 捕获是 browse_e2e 证据
+    # 链新增的同 workspace 附带调用，见 capture_browser_console）。
+    assert seen and set(seen) == {str(wt)}
+    assert seen[0] == str(wt)
     text = (result.output or "") + (result.error or "")
     assert "browse_e2e REJECTED" in text
     assert "browse_main" in text
@@ -124,7 +128,8 @@ async def test_browse_main_runs_at_project_root(tmp_path):
         )
 
     assert result.success is True
-    assert seen == [str(main), str(main)]
+    # browse_main 把 browse 及其 console 捕获附带调用全部改写到 project root。
+    assert seen and set(seen) == {str(main)}
     assert stamped == [str(main)]
     assert "cwd=project root" in (result.output or "")
     assert "attestation_id=att-1" in (result.output or "")

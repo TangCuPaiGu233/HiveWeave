@@ -196,6 +196,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "After screenshot, pixels inject into the next turn. "
             "Do not assume screenshot.png at repo root or agent-browser/tmp. "
             "CEO looking at the product does not stamp. "
+            "Browser console/page errors are auto-captured after each "
+            "command — appended as a [console] section in the result and "
+            "counted in the browse_e2e attestation's console_errors; read "
+            "it before blaming the DOM probe. "
             "Stays in YOUR workspace. Milestone VERIFY / full-site MAIN QA "
             "(and CEO looking at MAIN): use browse_main."
         ),

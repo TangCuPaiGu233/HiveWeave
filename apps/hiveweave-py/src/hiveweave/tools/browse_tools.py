@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import shlex
 import tempfile
@@ -850,6 +851,10 @@ async def _hard_recycle_browser() -> str:
     from hiveweave.util.win_subprocess import windows_no_window_kwargs
 
     bin_name = agent_browser_bin_name()
+    # taskkill /IM (或 pkill -f) 杀掉的是**所有** agent-browser daemon ——
+    # 全部会话的 errors 缓冲随之归零，pageerror 去重状态必须整体作废，
+    # 否则重建会话里重生的同文本错误会被误吞。
+    _pageerror_seen.clear()
     try:
         if os.name == "nt":
             # 1) Daemon + its Chromium tree (taskkill /T is recursive).
@@ -969,6 +974,247 @@ def browse_missing_bin_hint() -> str:
     return hint
 
 
+# ── Browser console capture (browse_e2e / visual_check evidence) ─────────
+#
+# Why: DOM probes alone fly blind — a page whose JS throws (e.g. an undeclared
+# variable) can still render a plausible a11y tree, and agents burned hours
+# mis-reading that as a product bug. agent-browser buffers both streams:
+#
+#   console [--clear]   console output (log/warn/error/info)
+#   errors  [--clear]   uncaught page exceptions
+#
+# both honoring the global ``--json`` flag. Envelopes verified live
+# (2026-09-05, agent-browser CLI):
+#   console --json → {"success":true,"data":{"messages":[{"type","text"}…]}}
+#   errors  --json → {"success":true,"data":{"errors":[{"text","line",…}]}}
+#
+# Buffer semantics (verified live 2026-09-05, drives the design below):
+# - The combined form is NOT an atomic read+clear: ``console --clear --json``
+#   discards the buffer and returns {"cleared":true} (content lost), so read
+#   and clear must stay separate spawns.
+# - ``errors --clear`` is a no-op in this CLI build (buffer survives, CLI
+#   prints ✗): the errors stream cannot be cleared at all. Deltas therefore
+#   come from an in-process seen-text ledger (_dedup_pageerrors) instead of
+#   clearing; ledger resets when the daemon session is rebuilt (restart/
+#   close/hard-recycle). Same-text errors are reported once per session.
+# - console read → clear race window: a console error arriving between the
+#   read returning and the clear landing is destroyed and NOT counted (lost
+#   within this slice). The window is one spawn gap (clear is issued right
+#   after read); errors fired after the command returned surface on the next
+#   command's read instead.
+# - A failed console clear (rc≠0 / spawn error, e.g. timeout rc=-1) is
+#   fail-open but declared: the next read may repeat this batch (note in the
+#   [console] section).
+#
+# Fail-open contract: capture problems (binary missing, old CLI without the
+# subcommands, wedged daemon, bad payload — including key-name drift where
+# data is a dict without the expected list keys) must never fail the browse
+# command itself — they degrade to console_errors=0 plus an explicit "not
+# captured" line in the result text instead of silently claiming a clean page.
+#
+# Upgrade path: if the CLI buffer proves unreliable (lost across daemon
+# restarts, dropped in future versions), replace the spawn reads below
+# with an in-process playwright session (page.on("console") /
+# page.on("pageerror")) behind the same capture_browser_console signature —
+# callers and the [console] result contract stay unchanged.
+_CONSOLE_CAPTURE_TIMEOUT_SEC = 10
+_CONSOLE_TEXT_MAX_LINES = 50
+_CONSOLE_TEXT_MAX_BYTES = 4096
+_ERROR_SEEN_CAP = 500
+CONSOLE_CAPTURE_UNAVAILABLE_NOTE = (
+    "[console] agent-browser CLI 未提供 console 捕获（版本/不可用或输出不可读），"
+    "如需排查前端错误请用 bash 跑浏览器开发者协议"
+)
+CONSOLE_CLEAR_FAILED_NOTE = (
+    "[console] console 缓冲清理失败（退出码非 0/超时），"
+    "下条命令可能重复本批 console 错误。"
+)
+
+# errors 流的增量状态：agent_id(→daemon session 名) → 已上报文本集。
+# 仅进程内 —— 后端重启后同批错误会重报一次（宁重报，不漏报）。
+_pageerror_seen: dict[str, dict[str, None]] = {}
+
+
+def _reset_pageerror_tracker(agent_id: str | None) -> None:
+    """Daemon session rebuilt (close/restart): the new buffer starts empty, so
+    stale seen-texts must be dropped or a recurring same-text error would be
+    wrongly suppressed."""
+    _pageerror_seen.pop((agent_id or "default")[:40], None)
+
+
+def _dedup_pageerrors(agent_id: str | None, entries: list[str]) -> list[str]:
+    """Suppress already-reported page errors (errors buffer cannot be
+    cleared — see block comment). Text-level dedup: the same ReferenceError
+    fired by ten clicks is reported on the first occurrence only."""
+    key = (agent_id or "default")[:40]
+    seen = _pageerror_seen.setdefault(key, {})
+    fresh = [e for e in entries if e not in seen]
+    for e in fresh:
+        seen[e] = None
+    if len(seen) > _ERROR_SEEN_CAP:  # anti-growth: worst case one batch re-reports
+        _pageerror_seen[key] = dict.fromkeys(fresh[-_ERROR_SEEN_CAP:])
+    return fresh
+
+
+async def _read_ab_console_json(
+    argv: list[str], workspace: str, agent_id: str | None
+) -> dict[str, Any] | None:
+    """Run ``agent-browser <argv> --json`` and return its ``data`` envelope.
+
+    None on spawn failure, nonzero exit, timeout, or a payload that is not
+    ``{"success": true, "data": {...}}`` — older CLI builds without the
+    console/errors subcommands land here and the caller degrades to the
+    "unavailable" note.
+    """
+    try:
+        code, stdout, _stderr = await browse_exec(
+            [*argv, "--json"],
+            workspace,
+            timeout_sec=_CONSOLE_CAPTURE_TIMEOUT_SEC,
+            agent_id=agent_id,
+        )
+    except Exception:
+        return None
+    if code != 0:
+        return None
+    try:
+        payload = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return None
+    data = payload.get("data")
+    return data if isinstance(data, dict) else None
+
+
+def _console_error_entries(
+    console_data: dict[str, Any] | None,
+    errors_data: dict[str, Any] | None,
+) -> tuple[list[str], list[str]]:
+    """``(console_entries, pageerror_entries)`` — console messages with
+    type == "error" only, plus every page error (uncaught exceptions). One
+    rendered entry per source item."""
+    console_entries: list[str] = []
+    pageerror_entries: list[str] = []
+    msgs = (
+        console_data.get("messages") if isinstance(console_data, dict) else None
+    )
+    if isinstance(msgs, list):
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("type") or m.get("level") or "").lower() != "error":
+                continue
+            text = str(m.get("text") or "").strip()
+            if text:
+                console_entries.append(f"[error] {text}")
+    errs = errors_data.get("errors") if isinstance(errors_data, dict) else None
+    if isinstance(errs, list):
+        for e in errs:
+            text = (
+                str(e.get("text") or e.get("message") or "").strip()
+                if isinstance(e, dict)
+                else str(e).strip()
+            )
+            if text:
+                pageerror_entries.append(f"[pageerror] {text}")
+    return console_entries, pageerror_entries
+
+
+def _render_console_note(count: int, entries: list[str]) -> str:
+    """``[console]`` result section: header + raw error text, capped at
+    ``_CONSOLE_TEXT_MAX_LINES`` lines / ``_CONSOLE_TEXT_MAX_BYTES`` bytes."""
+    lines: list[str] = [f"[console] {count} browser console/page error(s):"]
+    shown = 0
+    used = 0
+    for entry in entries:
+        for raw in entry.splitlines() or [""]:
+            if shown >= _CONSOLE_TEXT_MAX_LINES:
+                lines.append("[console] …(truncated)")
+                return "\n".join(lines)
+            prefixed = f"[console] {raw}" if raw else "[console]"
+            cost = len(prefixed.encode("utf-8", errors="replace")) + 1
+            if used + cost > _CONSOLE_TEXT_MAX_BYTES:
+                lines.append("[console] …(truncated)")
+                return "\n".join(lines)
+            lines.append(prefixed)
+            used += cost
+            shown += 1
+    return "\n".join(lines)
+
+
+async def capture_browser_console(
+    workspace: str, agent_id: str | None
+) -> tuple[int, str]:
+    """Read browser console errors + uncaught page errors from the agent's
+    agent-browser session. Returns ``(console_errors, note)``.
+
+    ``note`` is the ``[console]`` section for the tool result text: raw error
+    lines when errors exist, a ``[console] 0 errors.`` line on a clean read,
+    or ``CONSOLE_CAPTURE_UNAVAILABLE_NOTE`` when the CLI cannot be read
+    (missing/old binary, wedged daemon, bad payload — including key-name
+    drift). Only in the unavailable case does 0 mean "not captured" — the
+    note says so explicitly.
+
+    Fail-open: never raises; capture failures must not fail the browse (or
+    assert_visual) command that triggered them.
+    """
+    try:
+        if not resolve_browse_bin():
+            return 0, CONSOLE_CAPTURE_UNAVAILABLE_NOTE
+        console_data = await _read_ab_console_json(
+            ["console"], workspace, agent_id
+        )
+        console_usable = isinstance(console_data, dict) and isinstance(
+            console_data.get("messages"), list
+        )
+        clear_note = ""
+        if console_usable:
+            # Clear right after the read (window shrinks to one spawn gap —
+            # see block comment). rc≠0/spawn error must not fail the capture,
+            # but the next read may repeat this batch → declare it (N-1).
+            try:
+                rc, _out, _err = await browse_exec(
+                    ["console", "--clear"],
+                    workspace,
+                    timeout_sec=_CONSOLE_CAPTURE_TIMEOUT_SEC,
+                    agent_id=agent_id,
+                )
+                if rc != 0:
+                    clear_note = CONSOLE_CLEAR_FAILED_NOTE
+            except Exception:
+                clear_note = CONSOLE_CLEAR_FAILED_NOTE
+        errors_data = await _read_ab_console_json(
+            ["errors"], workspace, agent_id
+        )
+        errors_usable = isinstance(errors_data, dict) and isinstance(
+            errors_data.get("errors"), list
+        )
+        if not console_usable and not errors_usable:
+            # Both streams unreadable: spawn failure / old CLI / bad payload
+            # (key-name drift keeps data a dict without the expected list
+            # keys). Declare "not captured" — never a fake-clean 0 (N-2).
+            return 0, CONSOLE_CAPTURE_UNAVAILABLE_NOTE
+        console_entries, pageerror_entries = _console_error_entries(
+            console_data, errors_data
+        )
+        # errors 缓冲清不掉 → 增量靠已读清单去重（见块注释）。
+        entries = [
+            *console_entries,
+            *_dedup_pageerrors(agent_id, pageerror_entries),
+        ]
+        if not entries:
+            note = "[console] 0 errors."
+        else:
+            note = _render_console_note(len(entries), entries)
+        if clear_note:
+            note = f"{note}\n{clear_note}"
+        return len(entries), note
+    except Exception as e:  # belt & braces — broken capture stays invisible
+        log.warning("browse_console_capture_failed", error=str(e))
+        return 0, CONSOLE_CAPTURE_UNAVAILABLE_NOTE
+
+
 async def issue_browse_e2e_attestation(
     *,
     agent_id: str,
@@ -978,11 +1224,18 @@ async def issue_browse_e2e_attestation(
     task_id: str | None = None,
     core_interaction: bool = False,
     screenshot_path: str | None = None,
+    console_errors: int = 0,
 ) -> str:
     """Create browse_e2e attestation; return note fragment (may be empty).
 
     ``screenshot_path`` (abs) is merged into ``artifact_hashes`` so a
     reviewer can load the PNG via ``look_at_image(attestation_id=...)``.
+
+    ``console_errors`` is the REAL count of browser console errors + uncaught
+    page errors captured around this command (delta since the previous read,
+    see capture_browser_console). Callers that do not capture (e.g. the
+    game_run_case harness) keep the default 0 — 0 therefore means "not
+    captured or zero errors", not a verified-clean page.
     """
     needs_main = False
     try:
@@ -1077,7 +1330,7 @@ async def issue_browse_e2e_attestation(
             commit=commit,
             stdout_hash=hash_stdout(stdout),
             artifact_hashes=artifact_hashes,
-            console_errors=0,
+            console_errors=max(0, int(console_errors or 0)),
         )
         extra = " core_interaction=1" if core_interaction else ""
         return f"\n[attestation_id={att_id} kind=browse_e2e{extra}]{bind_note}"
@@ -1308,12 +1561,32 @@ async def browse_tool(
 
     core_interaction = head in ("js", "eval", "evaluate")
     look_only = await agent_is_look_only_browser(agent_id)
+    console_count = 0
+    console_note = ""
+    console_suffix = ""
     if look_only:
         attest_note = (
             "\n\n[look-only] No browse_e2e stamp — looking at the product "
             "is not test evidence. Formal VERIFY stays with QA.\n"
         )
     else:
+        # Console capture BEFORE stamping: feeds the attestation's
+        # console_errors and the [console] result section. Read-then-clear
+        # gives per-command deltas; late async page errors surface on the
+        # next command's read. Skipped where it is meaningless or
+        # self-defeating: console/errors (the agent is reading the buffer
+        # itself — capture would eat what they asked for) and close
+        # (quit/exit/restart aliases — the buffer dies with the session).
+        if head_norm == "close":
+            # This agent's daemon session dies with close (quit/exit aliases
+            # included): its errors buffer is gone, so the pageerror seen-text
+            # ledger must reset or a recurring error would be suppressed.
+            _reset_pageerror_tracker(agent_id)
+        if head_norm not in ("console", "errors", "close"):
+            console_count, console_note = await capture_browser_console(
+                workspace, agent_id
+            )
+            console_suffix = f"\n{console_note}" if console_note else ""
         attest_note = await issue_browse_e2e_attestation(
             agent_id=agent_id,
             workspace=workspace,
@@ -1322,9 +1595,13 @@ async def browse_tool(
             task_id=params.task_id,
             core_interaction=core_interaction,
             screenshot_path=screenshot_abs,
+            console_errors=console_count,
         )
         if "[browse_e2e REJECTED]" in attest_note:
-            return ToolResult.err(attest_note.strip())
+            # The buffer was already read (and cleared) for the count, so the
+            # captured text must not be dropped with the rejected evidence —
+            # the agent may be debugging exactly why VERIFY got rejected.
+            return ToolResult.err(attest_note.strip() + console_suffix)
 
     # 大快照短契约化 —— attestation 先按全量 stdout 出证（stdout_hash
     # 完整性），返回文本再收短契约；<50KB 的快照原样返回。
@@ -1344,6 +1621,7 @@ async def browse_tool(
             out = (
                 f"{out}{attest_note}\n"
                 + screenshot_followup_text(shot_display, look_only=look_only)
+                + console_suffix
             )
             return ToolResult.ok(out, **extra_fields)
 
@@ -1362,10 +1640,11 @@ async def browse_tool(
             "[VISION] Screenshot file could not be loaded into multimodal "
             f"context (path={shot_display}). Re-take screenshot using "
             f"{shot_display}; {fail_hint}"
+            + console_suffix
         )
         return ToolResult.ok(out)
 
-    return ToolResult.ok(out + attest_note)
+    return ToolResult.ok(out + attest_note + console_suffix)
 
 
 @tool(
@@ -1502,6 +1781,7 @@ async def assert_visual_tool(
 
     attest_note = ""
     att_id = None
+    console_note = ""
     try:
         from hiveweave.services.attestation import (
             VISUAL_CHECK_KIND,
@@ -1575,6 +1855,14 @@ async def assert_visual_tool(
                             "not browse (your worktree)."
                             + (bind_note or "")
                         )
+            # Console capture for the visual_check stamp: same read-then-clear
+            # delta semantics as browse_tool. The preceding browse command
+            # already consumed its share, so this counts page errors fired
+            # since the screenshot — and stays honest (fail-open note) when
+            # the CLI cannot be read. Never raises (fail-open inside).
+            console_count, console_note = await capture_browser_console(
+                workspace, agent_id
+            )
             commit = await _maybe_git_commit(workspace or "")
             payload = {
                 "kind": VISUAL_CHECK_KIND,
@@ -1601,14 +1889,20 @@ async def assert_visual_tool(
                 stdout_hash=hash_stdout(blob),
                 stdout=blob,
                 artifact_hashes={"screenshot_path": str(shot)},
-                console_errors=0,
+                console_errors=max(0, int(console_count or 0)),
             )
             attest_note = (
                 f"\n[attestation_id={att_id} kind={VISUAL_CHECK_KIND} "
                 f"verdict={params.verdict}]"
             )
     except Exception as e:
-        return ToolResult.err(f"assert_visual attestation failed: {e}")
+        # The console buffer was already read (and possibly cleared) for the
+        # count before the stamp failed — do not drop the captured text with
+        # the exception (N-5): it may be the only trace of those errors.
+        msg = f"assert_visual attestation failed: {e}"
+        if console_note:
+            msg = f"{msg}\n{console_note}"
+        return ToolResult.err(msg)
 
     out = (
         f"Visual check recorded: verdict={params.verdict}.\n"
@@ -1618,6 +1912,8 @@ async def assert_visual_tool(
         "[VISION] Image re-attached — confirm your observation still matches "
         "the pixels before submit_task."
     )
+    if console_note:
+        out = f"{out}\n{console_note}"
     return ToolResult.ok(
         out,
         images=[img],

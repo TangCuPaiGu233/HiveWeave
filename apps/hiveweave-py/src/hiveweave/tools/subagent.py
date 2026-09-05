@@ -406,12 +406,56 @@ def _subagent_identity(
     return "\n".join(lines)
 
 
+#: 上游/环境类失败关键字（小写匹配）—— 只做事实位判定，不是重分类器。
+#: 命中 = 环境瞬断（原样重试常可成）；未命中但有 reason = 子侧逻辑/配置。
+_UPSTREAM_FAILURE_KEYWORDS = (
+    "ssl", "timeout", "timed out", "connection", "connect",
+    "circuit breaker", "rate limit", "overloaded", "temporarily",
+    "unavailable", "gateway", "eof", "reset by peer", "broken pipe",
+    "stream idle",
+)
+#: HTTP error_status 的量程归类（读到什么用什么，不发明新桶）。
+_UPSTREAM_ERROR_STATUS = {429, 500, 502, 503, 504, 529}
+_LOGIC_ERROR_STATUS = {400, 401, 402, 403, 404, 409, 422}
+
+
+def _subagent_failure_class(
+    reason: str | None, error_status: int | None = None
+) -> str:
+    """子代理失败分类事实位：upstream（环境瞬断）vs logic（子侧问题）。
+
+    42 轮实证（dsh42 青岩×2/方糖、s3c09 潮汐）：错误恒为「subagent
+    failed」，父无法区分「上游瞬断可原样重试」与「子逻辑错误需改 prompt」。
+    本判定只读既有事实（子 run 的 error_status + reason 关键字），
+    证据不足返回 unknown，不臆断。
+    """
+    if error_status is not None:
+        try:
+            es = int(error_status)
+        except (TypeError, ValueError):
+            es = None
+        if es is not None:
+            if es in _UPSTREAM_ERROR_STATUS:
+                return "upstream"
+            if es in _LOGIC_ERROR_STATUS:
+                return "logic"
+    text = (reason or "").strip().lower()
+    if not text:
+        return "unknown"
+    if any(k in text for k in _UPSTREAM_FAILURE_KEYWORDS):
+        return "upstream"
+    return "logic"
+
+
 async def _record_subagent_step(
     parent: Any,
     status: str = "completed",
     *,
     run_id: str | None = None,
     counter: int | None = None,
+    reason: str | None = None,
+    error_status: int | None = None,
+    child_status: str | None = None,
 ) -> None:
     """P1-6/P2-5：子代理在父 run 的 run_steps 留一条步骤。
 
@@ -421,6 +465,11 @@ async def _record_subagent_step(
     因此由 spawn 侧在父 turn 活跃时**快照** run_id/counter，子代理完成后
     用模块级 ``run_ledger`` 单例落账（不依赖父对象存活）。
     best-effort 不阻塞子代理返回。
+
+    失败时（status != "completed"）：
+    - ``reason``: 子 run 的失败原因原文（error 文案 / 异常），截 200 字符；
+    - ``error_status``: 子 run 的 HTTP error_status（上游/逻辑分类用）；
+    - ``child_status``: 子 run 终止 status（如 streamer 的 "error"）。
     """
     if run_id is None:
         run_id = getattr(parent, "_current_run_id", None)
@@ -439,11 +488,26 @@ async def _record_subagent_step(
             tool_name="spawn_subagent",
         )
         if step_id:
+            # 42 轮 P1：失败不能只写「subagent failed」——带子 run 终止
+            # status/reason（截 200 字符防泄漏/超长）+ 上游/逻辑分类位，
+            # 父代理据此区分「环境瞬断可原样重试」与「子逻辑错误需改 prompt」。
+            error = None
+            if status != "completed":
+                reason_text = (reason or "unknown reason").strip()
+                # 分类用原始 reason（_subagent_failure_class None-safe）：
+                # 兜底文案「unknown reason」只做展示、不参与分类 —— 否则
+                # 「证据不足」被臆断成 logic，误导父代理改 prompt 而非重试
+                # （审计 P1：docstring 承诺 unknown 不臆断）。
+                failure_class = _subagent_failure_class(reason, error_status)
+                error = (
+                    f"subagent failed (status={child_status or status}, "
+                    f"class={failure_class}, reason={reason_text[:200]})"
+                )
             await _rl.record_step_end(
                 getattr(parent, "id", None) or getattr(parent, "short_id", None),
                 step_id,
                 status=status,
-                error="subagent failed" if status != "completed" else None,
+                error=error,
             )
     except Exception:
         pass  # best-effort
@@ -557,6 +621,11 @@ async def _run_subagent(
             await _record_subagent_step(
                 parent, status="failed",
                 run_id=snap_run_id, counter=snap_step_counter,
+                reason=(
+                    f"timed out after {timeout_s:g}s "
+                    "(auto-retried once; upstream gateway likely degraded)"
+                ),
+                child_status="timeout",
             )
             return {
                 "status": "error",
@@ -570,6 +639,7 @@ async def _run_subagent(
             await _record_subagent_step(
                 parent, status="failed",
                 run_id=snap_run_id, counter=snap_step_counter,
+                reason=f"retry failed: {retry_err}",
             )
             return {
                 "status": "error",
@@ -579,6 +649,7 @@ async def _run_subagent(
         await _record_subagent_step(
             parent, status="failed",
             run_id=snap_run_id, counter=snap_step_counter,
+            reason=f"{type(e).__name__}: {e}",
         )
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
@@ -604,11 +675,21 @@ async def _run_subagent(
                         parent_id=parent.id, error=str(meter_err))
 
     # P1-6/P2-5：子代理步骤留痕（父 run 的 run_steps，off-turn 用快照落账）
+    child_ok = result.get("status") == "ok"
     await _record_subagent_step(
         parent,
-        status="completed" if result.get("status") == "ok" else "failed",
+        status="completed" if child_ok else "failed",
         run_id=snap_run_id,
         counter=snap_step_counter,
+        # 原始 error 透传（缺失则 None）：分类是事实位判定，提前伪造
+        # 「unknown error」会把 unknown 类污染成 logic（审计 P1）；
+        # 展示兜底由 _record_subagent_step 统一加。
+        reason=(
+            None if child_ok or not result.get("error")
+            else str(result["error"])
+        ),
+        error_status=None if child_ok else result.get("error_status"),
+        child_status=None if child_ok else str(result.get("status") or "error"),
     )
 
     if result.get("status") != "ok":

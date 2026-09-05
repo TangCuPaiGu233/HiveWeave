@@ -624,6 +624,7 @@ def test_cache_creation_scope_aggregation():
     assert cache_creation_scope("") == CACHE_SCOPE_UNREPORTED
 
     row = _with_cache_scope({
+        "llm_calls": 20,
         "input_tokens": 1_000,
         "cache_read_tokens": 9_000,
         "cache_creation_tokens": 0,
@@ -633,6 +634,23 @@ def test_cache_creation_scope_aggregation():
     assert row["cache_hit_percent"] == 90
     assert "not reported by provider" in row["cache_hit_basis"]
     assert "providers" not in row
+
+    # 42 轮 P2-9：行数 <20 → 命中率输出「样本不足」而非乐观上限数值
+    thin = _with_cache_scope({
+        "llm_calls": 19,
+        "input_tokens": 1_000,
+        "cache_read_tokens": 9_000,
+        "cache_creation_tokens": 0,
+        "providers": "openai-responses",
+    })
+    assert thin["cache_hit_percent"] == "样本不足"
+    no_count = _with_cache_scope({
+        "input_tokens": 1_000,
+        "cache_read_tokens": 9_000,
+        "cache_creation_tokens": 0,
+        "providers": "openai-responses",
+    })
+    assert no_count["cache_hit_percent"] == "样本不足"
 
 
 def test_anthropic_message_delta_keeps_cache_from_start():

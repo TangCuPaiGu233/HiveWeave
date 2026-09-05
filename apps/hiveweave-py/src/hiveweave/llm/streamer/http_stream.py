@@ -513,7 +513,7 @@ class HttpStreamMixin:
         try:
             while True:
                 # Idle watchdog: wait only for the next SSE event. First
-                # token uses FIRST_CHUNK; afterwards IDLE (default 5 min).
+                # token uses FIRST_CHUNK; afterwards IDLE (default 75s).
                 # Turn wall clock (always on) can still cut earlier.
                 wait_s = stream_chunk_wait_s(got_event=got_event)
                 if budget_deadline is not None:

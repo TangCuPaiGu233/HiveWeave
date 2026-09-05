@@ -611,6 +611,7 @@ PROJECT_DB_TABLES = [
         total_tokens INTEGER DEFAULT 0,
         duration_ms INTEGER DEFAULT 0,
         cold_start INTEGER DEFAULT 0,
+        creation_unreported INTEGER DEFAULT 0,
         created_at INTEGER NOT NULL
     )
     """,
@@ -619,6 +620,12 @@ PROJECT_DB_TABLES = [
     # 可见可统计（r4：20 run 首请求零命中，合计 ~1.7M tokens 前缀重建无账）。
     # 旧库迁移（新库由上方 CREATE 直接带列；ALTER 必须排在 CREATE 之后）。
     """ALTER TABLE llm_usage ADD COLUMN cold_start INTEGER DEFAULT 0""",
+    # 42 轮 P2-9：cache_creation=0 分母缺分量打标 —— 1 = provider 本轮
+    # 未回传 cache 写入（usage 缺字段，或 provider 族根本不上报），此时
+    # cache_creation_tokens 的 0 是「无数据」；0 = 上游真回传（含真 0）。
+    # 量程位由 llm/util.normalize_usage 的 cache_creation_reported 单一判据
+    # 取反落库，新旧库都由 ALTER 补列（与 cold_start 同模式）。
+    """ALTER TABLE llm_usage ADD COLUMN creation_unreported INTEGER DEFAULT 0""",
 ]
 
 # ── Per-project DB 建表自检（迁移顺序缺陷防护）────────────────
@@ -629,7 +636,7 @@ PROJECT_DB_TABLES = [
 # DSH 对照：deepseek-harness invariant 框架的启动自检同构
 # （packages/llm/token-meter/src/invariant.ts）。
 PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
-    "llm_usage": {"cold_start"},
+    "llm_usage": {"cold_start", "creation_unreported"},
     "run_steps": {"runner_failed", "command_failed", "injection_applied", "timeout_kind", "timeout_ms"},
 }
 

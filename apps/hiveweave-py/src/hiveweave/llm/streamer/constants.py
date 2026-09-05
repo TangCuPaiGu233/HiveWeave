@@ -269,9 +269,18 @@ FIRST_CHUNK_TIMEOUT_S = 90.0
 """首 chunk 超时（TS 防线②，thinking 模型首 token 可能 60-90s）。"""
 
 IDLE_TIMEOUT_S = float(
-    _os.environ.get("HIVEWEAVE_STREAM_IDLE_TIMEOUT_S", "300") or "300"
+    _os.environ.get("HIVEWEAVE_STREAM_IDLE_TIMEOUT_S", "75") or "75"
 )
-"""后续 chunk 空闲看门狗（默认 5min）。真停滞才杀，不是整轮写码到点必杀。"""
+"""后续 chunk 空闲看门狗（默认 75s，2026-09 42 轮 P1-7 残余下调）。
+
+旧值 300s：上游 429 全员退避风暴期，一条已开口的流静默 5min 才判死，
+单次检测烧满 5min（42 轮实测全场 100min 空窗/9 次）。首 token 前的
+思考等待由 FIRST_CHUNK_TIMEOUT_S(90s) 单独承担；已出字后 >1min 无任何
+SSE 事件（长连接下连 keepalive/空帧都没有）按链路半死处理，75s 取
+60-90s 快速重发带的中位，并为 socket read（idle+30=105s）留余量。
+到点语义不变（判死 → 既有重试/收口接管），只调阈值。必须仍显著低于
+STREAMING_ZOMBIE_TIMEOUT_MS（game_time orphan 扫描，默认 300s）——
+两层是不同机制，勿混。"""
 
 # Socket read must outlive the idle watchdog so httpx does not kill first.
 STREAM_SOCKET_READ_TIMEOUT_S = IDLE_TIMEOUT_S + 30.0

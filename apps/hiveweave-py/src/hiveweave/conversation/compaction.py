@@ -422,16 +422,23 @@ async def _call_compactor_llm(
                     usage.get("prompt_tokens_details")
                     or usage.get("input_tokens_details")
                 )
-                norm = normalize_usage(
-                    {
-                        "input": usage.get("prompt_tokens") or usage.get("input_tokens") or 0,
-                        "output": usage.get("completion_tokens") or usage.get("output_tokens") or 0,
-                        "prompt_tokens_details": details,
-                        "prompt_cache_hit_tokens": usage.get("prompt_cache_hit_tokens"),
-                        "prompt_cache_miss_tokens": usage.get("prompt_cache_miss_tokens"),
-                    },
-                    provider,
-                )
+                raw_usage = {
+                    "input": usage.get("prompt_tokens") or usage.get("input_tokens") or 0,
+                    "output": usage.get("completion_tokens") or usage.get("output_tokens") or 0,
+                    "prompt_tokens_details": details,
+                    "prompt_cache_hit_tokens": usage.get("prompt_cache_hit_tokens"),
+                    "prompt_cache_miss_tokens": usage.get("prompt_cache_miss_tokens"),
+                }
+                # 透传 cache 写入原字段：仅在上游真的带值时加键 ——
+                # usage_has_cache_creation_field 按键存在判定 reported，
+                # 恒加键会把「没回传」误标成「真回传 0」（42 轮 P2-9）。
+                for wire_field, src in (
+                    ("cache_creation", "cache_creation_input_tokens"),
+                    ("cache_creation_tokens", "cache_creation_tokens"),
+                ):
+                    if usage.get(src) is not None:
+                        raw_usage[wire_field] = usage.get(src)
+                norm = normalize_usage(raw_usage, provider)
                 if norm:
                     await token_meter.record_compaction(
                         agent_id=agent_id,
@@ -442,6 +449,7 @@ async def _call_compactor_llm(
                         cache_creation_tokens=norm["cache_creation"],
                         kind=kind,
                         provider=provider,
+                        creation_unreported=0 if norm["cache_creation_reported"] else 1,
                     )
             except Exception as meter_err:
                 logger.warning("compactor_token_meter_failed",

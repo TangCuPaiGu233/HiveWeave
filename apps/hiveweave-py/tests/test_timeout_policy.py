@@ -46,11 +46,18 @@ def test_turn_budget_constants_structurally_sane():
     assert c.TOTAL_TIMEOUT_S < c.HARD_TOTAL_TIMEOUT_S < c.AGENT_SAFETY_CEILING_S
 
 
-def test_idle_watchdog_default_is_five_minutes():
-    assert IDLE_TIMEOUT_S == 300.0
+def test_idle_watchdog_default_is_75s_fast_redelivery():
+    """42 轮 P1-7：流式 idle 判死 300s→75s 快速重发（429 风暴期单次检测
+    不再烧 5min）。首 token 前仍由 FIRST_CHUNK(90s) 承担；socket read
+    (idle+30) 必须留在看门狗之后。"""
+    assert IDLE_TIMEOUT_S == 75.0
     assert stream_chunk_wait_s(got_event=False) == FIRST_CHUNK_TIMEOUT_S
     assert stream_chunk_wait_s(got_event=True) == IDLE_TIMEOUT_S
-    assert STREAM_SOCKET_READ_TIMEOUT_S > IDLE_TIMEOUT_S
+    assert STREAM_SOCKET_READ_TIMEOUT_S == IDLE_TIMEOUT_S + 30.0
+    # 两层机制不混：streamer idle 判死必须早于 game_time orphan 扫描阈值
+    from hiveweave.services.game_time import STREAMING_ZOMBIE_TIMEOUT_MS
+
+    assert IDLE_TIMEOUT_S * 1000 < STREAMING_ZOMBIE_TIMEOUT_MS
 
 
 def test_job_kill_visible_to_builders_not_ceo():

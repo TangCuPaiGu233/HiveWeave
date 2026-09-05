@@ -13,8 +13,10 @@
 
 缓存量程（P2-⑨）: ``cache_creation_tokens`` 只有 Anthropic 系上报，OpenAI 系
 线上根本不带该字段。因此聚合结果附 ``cache_creation_scope``
-（reported/unreported/mixed）+ ``cache_hit_basis``，让命中率能说清分母 ——
-不新增列，能力位由既有 ``provider`` 列按 ``llm.util`` 的单一判据现算。
+（reported/unreported/mixed）+ ``cache_hit_basis``，让命中率能说清分母。
+逐行量程位（42 轮 P2-9）：llm_usage.creation_unreported=1 表示该行
+provider 未回传 cache 写入（0 是「无数据」），0 = 上游真回传（含真 0）；
+行数不足 MIN_CACHE_HIT_SAMPLE_ROWS 时聚合命中率输出「样本不足」而非数值。
 """
 
 from __future__ import annotations
@@ -87,6 +89,13 @@ _CACHE_HIT_BASIS = {
         "input+cache_read+cache_creation (partial: mixed providers)",
 }
 
+#: 命中率最小样本量（42 轮 P2-9）：usage 行数低于此值时分母缺分量，
+#: 命中率只是乐观上限 —— 输出「样本不足」而非数值。
+MIN_CACHE_HIT_SAMPLE_ROWS = 20
+
+INSUFFICIENT_SAMPLE_NOTE = "样本不足"
+"""cache_hit_percent 在 usage 行数 < MIN_CACHE_HIT_SAMPLE_ROWS 时的文案。"""
+
 
 def _with_cache_scope(row: dict[str, Any]) -> dict[str, Any]:
     """把 providers CSV 换成量程字段 + 命中率（含分母口径说明）。
@@ -104,12 +113,18 @@ def _with_cache_scope(row: dict[str, Any]) -> dict[str, Any]:
     from hiveweave.llm.util import provider_input_inclusive
 
     inclusive = bool(names) and all(provider_input_inclusive(p) for p in names)
-    row["cache_hit_percent"] = cache_hit_percent(
-        int(row.get("input_tokens") or 0),
-        int(row.get("cache_read_tokens") or 0),
-        int(row.get("cache_creation_tokens") or 0),
-        input_inclusive=inclusive,
-    )
+    # 样本不足判据（42 轮 P2-9）：行数 < 阈值时不给数值 —— 双项目实测
+    # cache_creation 全 0 时 94.77/95.27% 均为乐观上限，小样本数字只会
+    # 误导归因。给出文案而非 None，让报表/终端直读可辨。
+    if int(row.get("llm_calls") or 0) < MIN_CACHE_HIT_SAMPLE_ROWS:
+        row["cache_hit_percent"] = INSUFFICIENT_SAMPLE_NOTE
+    else:
+        row["cache_hit_percent"] = cache_hit_percent(
+            int(row.get("input_tokens") or 0),
+            int(row.get("cache_read_tokens") or 0),
+            int(row.get("cache_creation_tokens") or 0),
+            input_inclusive=inclusive,
+        )
     row["cache_hit_basis"] = (
         "cache_read/input (provider prompt includes cache hit+miss)"
         if inclusive
@@ -158,13 +173,17 @@ class TokenMeter:
         for i, r in enumerate(rounds):
             if not isinstance(r, dict):
                 continue
+            # 42 轮 P2-9 打标：normalize_usage 的 cache_creation_reported
+            # 取反落列 —— 1 = provider 未回传 cache 写入（0 是「无数据」），
+            # 0 = 上游真回传（含真 0）。旧路径无该位按未回传处理。
+            creation_unreported = 0 if r.get("cache_creation_reported") else 1
             statements.append((
                 "INSERT INTO llm_usage "
                 "(id, agent_id, project_id, run_id, task_id, model_id, "
                 "request_type, provider, input_tokens, output_tokens, "
                 "cache_read_tokens, cache_creation_tokens, total_tokens, "
-                "duration_ms, cold_start, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "duration_ms, cold_start, creation_unreported, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     str(uuid.uuid4()),
                     agent_id,
@@ -181,6 +200,7 @@ class TokenMeter:
                     int(r.get("total", 0) or 0),
                     int(r.get("duration_ms", 0) or 0),
                     1 if (i == 0 and is_cold_start) else 0,
+                    creation_unreported,
                     # P2 观测（八轮 TEST_DSH_38）：优先用 streamer 逐次记录
                     # 的真实时刻；缺失（旧路径/异常分支）才退回批量盖章时刻。
                     int(r.get("ts") or now),
@@ -239,6 +259,7 @@ class TokenMeter:
         cache_creation_tokens: int = 0,
         kind: str = "conversation",
         provider: str | None = None,
+        creation_unreported: int = 0,
     ) -> None:
         """落库一次压缩 LLM 调用（绕过 Streamer，F3 修正）。
 
@@ -246,6 +267,9 @@ class TokenMeter:
         total 口径与主/子代理一致 = input + output + cache_creation
         （cache_read 单独列示，不计入 total）。
         压缩调用无 run_id（在 run 外执行），project_id 由 agent 解析。
+        ``creation_unreported``：1 = provider 未回传 cache 写入
+        （与 record_rounds 同口径，调用方由 normalize_usage 的
+        cache_creation_reported 取反传入）。
         """
         try:
             project_id = await meta_db.get_agent_project_id(agent_id)
@@ -265,8 +289,8 @@ class TokenMeter:
                 "(id, agent_id, project_id, run_id, task_id, model_id, "
                 "request_type, provider, input_tokens, output_tokens, "
                 "cache_read_tokens, cache_creation_tokens, total_tokens, "
-                "duration_ms, created_at) "
-                "VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                "duration_ms, creation_unreported, created_at) "
+                "VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
                 [
                     str(uuid.uuid4()),
                     agent_id,
@@ -279,6 +303,7 @@ class TokenMeter:
                     cache_read_tokens,
                     cache_creation_tokens,
                     total,
+                    1 if creation_unreported else 0,
                     _now_ms(),
                 ],
             )

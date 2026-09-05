@@ -93,9 +93,13 @@ def test_cache_hit_percent_input_inclusive():
 
 
 def test_deepseek_rows_get_inclusive_basis():
-    from hiveweave.services.token_meter import _with_cache_scope
+    from hiveweave.services.token_meter import MIN_CACHE_HIT_SAMPLE_ROWS, _with_cache_scope
 
     row = {
+        # 42 轮 P2-9 样本不足判据：行数 <20 时命中率输出「样本不足」。
+        # 本用例测的是 inclusive 分母的百分比数学（800/1000=80%），
+        # 播种 llm_calls 到阈值以上以拿到数值分支。
+        "llm_calls": MIN_CACHE_HIT_SAMPLE_ROWS,
         "providers": "deepseek",
         "input_tokens": 1000,
         "cache_read_tokens": 800,

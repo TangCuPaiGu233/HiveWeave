@@ -795,3 +795,116 @@ def test_spawn_subagent_rejects_write_for_qa_with_coordinator_perm():
             params, agent_id="qa-1", workspace="/ws"))
     assert result.success is False
     assert "SOURCE_WRITE" in (result.error or "")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 42 轮 P1：spawn_subagent 失败正交上报（error 带子 run status/reason + 分类）
+# ──────────────────────────────────────────────────────────────────────────
+
+from hiveweave.tools.subagent import (
+    _record_subagent_step,
+    _subagent_failure_class,
+)
+
+
+def _patch_rl():
+    """Patch run_ledger 单例：step_start 返回固定 step_id，step_end 落 captured。"""
+    captured: dict = {}
+
+    async def fake_start(*_a, **_k):
+        return "step-1"
+
+    async def fake_end(_agent_id, _step_id, *, status="completed", error=None,
+                       **_k):
+        captured["status"] = status
+        captured["error"] = error
+
+    return (
+        patch("hiveweave.tools.subagent._rl.record_step_start", fake_start),
+        patch("hiveweave.tools.subagent._rl.record_step_end", fake_end),
+        captured,
+    )
+
+
+def test_subagent_failure_step_carries_status_reason_and_class():
+    """失败：run_steps.error 带子 run 终止 status/reason（截 200）+ 分类位。"""
+    parent = _fake_parent()
+    parent._current_run_id = "run-live"
+    p_start, p_end, captured = _patch_rl()
+    long_reason = "upstream SSL EOF occurred in violation of protocol " * 20
+    import asyncio
+
+    with p_start, p_end:
+        asyncio.run(_record_subagent_step(
+            parent, status="failed",
+            reason=long_reason, child_status="error",
+        ))
+    assert captured["status"] == "failed"
+    err = captured["error"]
+    assert err is not None and err != "subagent failed"
+    assert "status=error" in err
+    assert "class=upstream" in err
+    assert "reason=" in err
+    # reason 截断 ~200 字符：整条 error 不携带超长原文，但真因片段可见
+    reason_part = err[err.index("reason=") + len("reason="):].removesuffix(")")
+    assert len(reason_part) <= 200
+    assert "violation" in err
+
+
+def test_subagent_completed_step_has_no_error():
+    """回归：正常完成 → error=None（不误打失败标记）。"""
+    parent = _fake_parent()
+    parent._current_run_id = "run-live"
+    p_start, p_end, captured = _patch_rl()
+    import asyncio
+
+    with p_start, p_end:
+        asyncio.run(_record_subagent_step(parent, status="completed"))
+    assert captured["status"] == "completed"
+    assert captured["error"] is None
+
+
+def test_subagent_failure_class_fact_bits():
+    """分类事实位：error_status 量程优先，其次 reason 关键字；未知不臆断。"""
+    assert _subagent_failure_class("x", error_status=429) == "upstream"
+    assert _subagent_failure_class("x", error_status=503) == "upstream"
+    assert _subagent_failure_class("x", error_status=400) == "logic"
+    assert _subagent_failure_class("Upstream SSL EOF") == "upstream"
+    assert _subagent_failure_class("First chunk timeout (90s)") == "upstream"
+    assert _subagent_failure_class("no model config available") == "logic"
+    assert _subagent_failure_class(None) == "unknown"
+    assert _subagent_failure_class("") == "unknown"
+
+
+def test_run_subagent_error_without_reason_is_unknown_class():
+    """生产包装路径（审计 P1）：子 run error 文案缺失 → class=unknown。
+
+    此前 `_run_subagent` 把缺失 error 预包装成「unknown error」再传参，
+    分类被带成 logic —— 误导父代理改 prompt 而非原样重试。兜底文案只能
+    做展示，分类必须吃原始值（None → unknown 不臆断）。
+    """
+    parent = _fake_parent()
+    parent._current_run_id = "run-live"  # 快照缺省回落：直调 _run_subagent 也落步骤
+
+    class ErrNoReasonStreamer:
+        def __init__(self, **kw):
+            pass
+
+        async def stream(self, **kw):
+            # 有 status=error 但无 error/error_status（如 budget 收口路径）
+            return {"status": "error", "content": "x", "rounds": 1}
+
+    p_start, p_end, captured = _patch_rl()
+    import asyncio
+
+    with patch(
+        "hiveweave.tools.subagent.Streamer", ErrNoReasonStreamer
+    ), p_start, p_end:
+        result = asyncio.run(_run_subagent(parent, "x", "y", 240, "readonly"))
+
+    assert result["status"] == "error"
+    err = captured["error"]
+    assert err is not None
+    assert "status=error" in err
+    assert "class=unknown" in err
+    assert "reason=unknown reason" in err  # 展示兜底，非分类依据

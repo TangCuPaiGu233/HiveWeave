@@ -54,9 +54,13 @@ export interface ChatMessage {
 }
 
 export interface MsgSegment {
-  type: "text" | "tool_call" | "thinking";
+  type: "text" | "tool_call" | "thinking" | "round_boundary";
   content?: string;
   tool?: ToolCall;
+  /** round_boundary 专用：实际轮号（0 起号，与后端 round_start 同口径）。
+   *  live 由 beginStreamRound 插入，持久化由后端 build_display_segments
+   *  产出 —— 同 kind 同渲染分支（live==persisted）。 */
+  round?: number;
 }
 
 export interface StreamDraft {

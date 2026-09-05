@@ -214,6 +214,24 @@ function ContextMarkerRow({ kind, content }: { kind: ContextMarkerKind; content:
 }
 
 /** 来源徽章 —— 气泡的核心职责：一眼看出这条消息来自谁。 */
+/**
+ * 轮次分隔线（round_boundary 段）：多轮 tool-loop 的轮与轮之间。
+ * live（draft 的 beginStreamRound）与持久化（metadata.segments 的
+ * build_display_segments）产同 kind 段 —— 此处同一分支渲染，done reload
+ * 不再丢轮次分隔。样式弱化（轮次是节奏信息，非边界警告）：居中细线 +
+ * 小字「第 N 轮」，round 0 起号故显示 N+1。
+ */
+function RoundBoundaryRow({ round }: { round?: number }) {
+  const label = typeof round === "number" ? `第 ${round + 1} 轮` : "新一轮";
+  return (
+    <div className="my-3 flex items-center gap-2" role="separator" aria-label={label}>
+      <span className="h-px flex-1 bg-g-border" aria-hidden="true" />
+      <span className="text-[10px] font-medium text-g-fg-4 shrink-0 select-none">{label}</span>
+      <span className="h-px flex-1 bg-g-border" aria-hidden="true" />
+    </div>
+  );
+}
+
 function SourceBadge({ source }: { source: "agent" | "system" | "watchdog" }) {
   if (source === "watchdog") {
     return (
@@ -441,6 +459,11 @@ function MessageBubbleInner({
             {!isUser && thinking && !segmentsHaveThinking && <ThinkingBlock content={thinking} />}
             {segments.map((seg, i) => {
               if (seg.type === "thinking" && seg.content) {
+              if (seg.type === "round_boundary") {
+                // live 与持久化共用此分支（渲染统一）：轮次分隔线不参与
+                // 文本流，永远独立成行。
+                return <RoundBoundaryRow key={`round-${seg.round ?? i}`} round={seg.round} />;
+              }
                 return <ThinkingBlock key={`think-${i}`} content={seg.content} />;
               }
               if (seg.type === "text" && seg.content) {

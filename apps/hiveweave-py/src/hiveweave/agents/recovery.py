@@ -252,8 +252,12 @@ async def persist_partial_turn(agent: Any, partial_result: dict) -> bool:
     if _same_failed_turn_already_persisted(existing, user_msg):
         return False
     # 只保留可回传的角色消息（assistant/tool/user），丢弃无关字段。
+    # 剥除 tool_loop _acc 标注的展示侧信道轮号（"round"）—— 未知键落进
+    # conversation store 会随历史回传 LLM 请求体，严格网关 400。
+    from hiveweave.llm.streamer.tool_loop import strip_round_annotations
+
     partial = [
-        m for m in tool_msgs
+        m for m in strip_round_annotations(tool_msgs)
         if isinstance(m, dict) and m.get("role") in ("assistant", "tool", "user")
     ]
     if not partial:

@@ -16,19 +16,16 @@ import type {
  * this draft instead of under-reporting prior rounds.
  */
 export function beginStreamRound(draft: StreamDraft, round?: number): StreamDraft {
-  // 轮次分隔（turn 级累计口径的配套结构，2026-09-01）：
-  // 后端 round_start 自 BUG-7 起全轮广播（round 0 起号），此前本函数是
-  // no-op——新轮旁白直接续写进上一轮 text 段，多轮 run 的旁白拼成一堵
-  // 无结构墙。修法不回到旧的「清空重写」（那会丢已见内容），而是插入
-  // 一个独立 text 段承载分隔标记：后续 text_delta 并入该段，每轮旁白
-  // 各自成段，工具块仍按时间线穿插。round>=1（即第 2 轮起）才插标记。
+  // 轮次分隔（2026-09-05 渲染统一）：插入独立 round_boundary 段，不再用
+  // 伪 text 段承载「—— 第 N 轮 ——」标记。round_boundary 不参与 text_delta
+  // 并段（merge 只认同 type 相邻），轮内旁白另起新 text 段；且与终稿
+  // metadata.segments（后端 build_display_segments 按 tool_turn_acc 轮号
+  // 标注产出 round_boundary）同 kind，live 与 done reload 走同一渲染分支。
+  // round 0 起号，与旧标记同阈值：round>=1（即第 2 轮起）才插。
   if (!round || round < 1) return draft;
   return {
     ...draft,
-    segments: [
-      ...draft.segments,
-      { type: "text", content: `\n\n—— 第 ${round + 1} 轮 ——\n\n` },
-    ],
+    segments: [...draft.segments, { type: "round_boundary", round }],
   };
 }
 
@@ -328,6 +325,14 @@ function normalizePersistedSegments(raw: unknown): MsgSegment[] | undefined {
       segs.push({ type: "text", content: s.content });
     } else if (s.type === "thinking" && typeof s.content === "string" && s.content) {
       segs.push({ type: "thinking", content: s.content });
+    } else if (s.type === "round_boundary") {
+      // 轮次边界段（后端 build_display_segments 产出）：透传轮号，
+      // 与 live draft（beginStreamRound）同 kind，同一分支渲染。
+      segs.push(
+        typeof s.round === "number"
+          ? { type: "round_boundary", round: s.round }
+          : { type: "round_boundary" },
+      );
     } else if (s.type === "tool_call" && s.tool) {
       segs.push({
         type: "tool_call",

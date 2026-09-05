@@ -18,7 +18,7 @@ import {
 import type { ChatMessage, StreamDraft } from "./types";
 
 describe("beginStreamRound", () => {
-  it("round>=1 时插入轮次分隔段，且不丢弃任何已有内容", () => {
+  it("round>=1 时插入 round_boundary 段（不再是伪 text），且不丢弃任何已有内容", () => {
     const draft: StreamDraft = {
       assistantId: "a1",
       segments: [
@@ -29,12 +29,9 @@ describe("beginStreamRound", () => {
     };
     const next = beginStreamRound(draft, 1);
     expect(next.assistantId).toBe("a1");
-    // 全量保留（DSH 整轮视图）+ 尾部分隔段
+    // 全量保留（DSH 整轮视图）+ 尾部轮次边界段
     expect(next.segments.slice(0, 3)).toEqual(draft.segments);
-    expect(next.segments[3]).toEqual({
-      type: "text",
-      content: "\n\n—— 第 2 轮 ——\n\n",
-    });
+    expect(next.segments[3]).toEqual({ type: "round_boundary", round: 1 });
     // 原 draft 不被突变
     expect(draft.segments).toHaveLength(3);
   });
@@ -48,18 +45,28 @@ describe("beginStreamRound", () => {
     expect(beginStreamRound(draft, undefined)).toBe(draft);
   });
 
-  it("分隔段是 text 段——后续 text_delta 自然并入，轮内旁白连续", () => {
+  it("round_boundary 是独立段——后续 text_delta 不并入，也不会再产生伪 text 标记", () => {
     let draft: StreamDraft = {
       assistantId: "a1",
       segments: [{ type: "text", content: "第一轮旁白" }],
     };
     draft = beginStreamRound(draft, 1);
-    // 模拟 text_delta 合并逻辑（last 为 text → merge）
+    // 模拟 useChatMessages 的 text_delta 合并逻辑：last.type === "text"
+    // 才并段；round_boundary 段使 delta 另起新 text 段
     const last = draft.segments[draft.segments.length - 1];
-    expect(last.type).toBe("text");
-    const merged = ((last as { content?: string }).content || "") + "第二轮旁白开始";
-    expect(merged).toContain("—— 第 2 轮 ——");
-    expect(merged.endsWith("第二轮旁白开始")).toBe(true);
+    const segType = "text" as const;
+    const willMergeIntoLast = !!last && last.type === segType;
+    expect(willMergeIntoLast).toBe(false);
+    const withDelta: StreamDraft = {
+      ...draft,
+      segments: [...draft.segments, { type: segType, content: "第二轮旁白开始" }],
+    };
+    // 轮内旁白独立成段，边界段不携带任何文本
+    expect(withDelta.segments[1]).toEqual({ type: "round_boundary", round: 1 });
+    expect(withDelta.segments[2]).toEqual({ type: "text", content: "第二轮旁白开始" });
+    expect(
+      withDelta.segments.some((s) => s.type === "text" && (s.content || "").includes("——")),
+    ).toBe(false);
   });
 });
 
@@ -290,6 +297,33 @@ describe("mergeStreamDraftIntoMessages", () => {
     expect(merged[0].isBackground).toBe(false);
     expect(merged[0].content).toBe("hi");
   });
+
+  it("carries round_boundary segments whole and keeps them out of content", () => {
+    const msgs = [
+      { id: "a1", role: "assistant" as const, content: "", timestamp: 1, isBackground: false },
+    ];
+    const merged = mergeStreamDraftIntoMessages(
+      msgs,
+      {
+        assistantId: "a1",
+        segments: [
+          { type: "text", content: "第一轮旁白" },
+          { type: "round_boundary", round: 1 },
+          { type: "text", content: "第二轮旁白" },
+        ],
+      },
+      { isStreaming: true },
+    );
+    // _segments 原样携带（渲染统一：live 与持久化同分支）
+    expect(merged[0]._segments?.map((s) => s.type)).toEqual([
+      "text",
+      "round_boundary",
+      "text",
+    ]);
+    expect(merged[0]._segments?.[1]).toEqual({ type: "round_boundary", round: 1 });
+    // content 只拼接 text 段——不再有「—— 第 N 轮 ——」标记混入
+    expect(merged[0].content).toBe("第一轮旁白第二轮旁白");
+  });
 });
 
 describe("mapDbToChatMessages", () => {
@@ -329,6 +363,30 @@ describe("mapDbToChatMessages", () => {
     expect(mapped[0]._segments?.[0]).toEqual({ type: "thinking", content: "先分析" });
     expect(mapped[0]._segments?.[3]).toEqual({ type: "thinking", content: "再总结" });
     expect(mapped[0]._segments?.[2].tool?.tool).toBe("read_file");
+  });
+
+  it("accepts round_boundary segments and passes the round through", () => {
+    const mapped = mapDbToChatMessages([
+      {
+        id: "a1",
+        role: "assistant",
+        content: "答复",
+        metadata: JSON.stringify({
+          segments: [
+            { type: "text", content: "第一轮" },
+            { type: "round_boundary", round: 1 },
+            { type: "text", content: "第二轮" },
+            { type: "round_boundary" }, // 缺轮号也放行（渲染端兜底文案）
+          ],
+        }),
+      },
+    ]);
+    expect(mapped[0]._segments).toEqual([
+      { type: "text", content: "第一轮" },
+      { type: "round_boundary", round: 1 },
+      { type: "text", content: "第二轮" },
+      { type: "round_boundary" },
+    ]);
   });
 });
 

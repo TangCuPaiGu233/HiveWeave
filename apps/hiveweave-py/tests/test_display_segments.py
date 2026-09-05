@@ -204,6 +204,85 @@ def test_empty_tail_pops_last_segment():
     assert texts == ["A"]
 
 
+# ── 轮次边界（round_boundary）：终稿与 live draft 渲染统一 ──────────
+
+
+def test_multi_round_turn_emits_round_boundaries():
+    """多轮对话：终稿 segments 在轮与轮之间产出 round_boundary 且轮号正确。
+
+    tool_loop _acc 给 tool_turn_acc 元素标注产出轮号（round 字段，0 起
+    号）；build_display_segments 在轮号前进且 >=1 时产出边界段 —— 终稿
+    与 live draft（beginStreamRound）同 kind，done reload 不再丢轮次分隔。
+    """
+    turn = [
+        # round 0：旁白 + 工具
+        {"role": "assistant", "content": "先看文件", "round": 0},
+        {"role": "assistant", "content": None,
+         "tool_calls": [_tc("c1", "read_file", '{"path":"a.py"}')], "round": 0},
+        {"role": "tool", "tool_call_id": "c1", "content": "file body", "round": 0},
+        # round 1：旁白 + 工具
+        {"role": "assistant", "content": "再搜索", "round": 1},
+        {"role": "assistant", "content": None,
+         "tool_calls": [_tc("c2", "search_files", '{"pattern":"x"}')], "round": 1},
+        {"role": "tool", "tool_call_id": "c2", "content": "no match", "round": 1},
+        # round 2：末轮收口（含 thinking）
+        {"role": "assistant", "content": "完成",
+         "reasoning_content": "末轮推理", "round": 2},
+    ]
+    segs = build_display_segments(turn, "完成", [])
+    kinds = [(s["type"], s.get("round")) for s in segs]
+    assert kinds == [
+        ("text", None),
+        ("tool_call", None),
+        ("round_boundary", 1),
+        ("text", None),
+        ("tool_call", None),
+        ("round_boundary", 2),
+        ("thinking", None),
+        ("text", None),
+    ]
+    # 边界段载荷只带轮号；工具结果回填不受边界段插入影响
+    assert segs[2] == {"type": "round_boundary", "round": 1}
+    assert segs[5] == {"type": "round_boundary", "round": 2}
+    assert segs[1]["result"] == "file body"
+    assert segs[4]["result"] == "no match"
+
+
+def test_single_round_turn_has_no_boundary():
+    """单轮对话（全部元素 round 0）：不产任何边界段（首轮前不产）。"""
+    turn = [
+        {"role": "assistant", "content": "先看文件", "round": 0},
+        {"role": "assistant", "content": None,
+         "tool_calls": [_tc("c1", "read_file", '{"path":"a.py"}')], "round": 0},
+        {"role": "tool", "tool_call_id": "c1", "content": "file body", "round": 0},
+        {"role": "assistant", "content": "完成", "round": 0},
+    ]
+    segs = build_display_segments(turn, "完成", [])
+    assert not any(s["type"] == "round_boundary" for s in segs)
+
+
+def test_unannotated_elements_emit_no_boundary():
+    """无 round 标注的元素（legacy 数据 / 平台收口尾注）不产边界段，
+    也不打断已建立的轮号追踪。"""
+    turn = [
+        {"role": "assistant", "content": "第一轮旁白", "round": 0},
+        {"role": "assistant", "content": "平台尾注（无标注）"},
+        {"role": "assistant", "content": "第二轮旁白", "round": 1},
+    ]
+    segs = build_display_segments(turn, "", [])
+    boundaries = [s for s in segs if s["type"] == "round_boundary"]
+    # 尾注归入第一轮段落（无边界）；round 0→1 前进处照常产边界
+    assert boundaries == [{"type": "round_boundary", "round": 1}]
+
+
+def test_first_annotated_element_at_round_1_has_no_boundary():
+    """round 0 无任何产出（无标注元素）时，首个元素即 round 1 —— 前面
+    没有内容，不产边界（「首轮前不产」语义）。"""
+    turn = [{"role": "assistant", "content": "直接开跑", "round": 1}]
+    segs = build_display_segments(turn, "直接开跑", [])
+    assert not any(s["type"] == "round_boundary" for s in segs)
+
+
 # ── P2-⑩：result_summary 恢复「一句话摘要」语义 ────────────────────
 
 

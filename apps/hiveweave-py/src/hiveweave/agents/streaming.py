@@ -168,26 +168,12 @@ async def on_delta(agent: Any, event: dict) -> None:
                 await agent._run_ledger.increment_llm_calls(agent.id, _run_id)
             except Exception:
                 pass
-        # 轮次结构化标记（2026-09-01，s3-clone_06 反馈「大段旁白」）：
-        # turn 级累计保留（不回到旧清空口径），但 DB 快照 content 在轮
-        # 边界插入分隔行——重连/中途打开聊天走 content 兜底渲染时从此
-        # 有轮次结构。finalize 的 content 由 segments 重建、不经 acc，
-        # 标记不会泄进终稿。round 为 0 起号（tool_loop BUG-7 口径），
-        # 首轮（0）不插。
-        try:
-            _round = int(event.get("round", 0) or 0)
-        except (TypeError, ValueError):
-            _round = 0
-        if _round >= 1 and agent._streaming_msg_id:
-            acc = getattr(agent, "_streaming_text_acc", "")
-            acc += f"\n\n—— 第 {_round + 1} 轮 ——\n\n"
-            agent._streaming_text_acc = acc
-            try:
-                await agent._chat_msg.update_message(
-                    agent.id, agent._streaming_msg_id, {"content": acc},
-                )
-            except Exception:
-                pass  # Best-effort
+        # 轮次结构标记已下线（2026-09-05 渲染统一）：此前这里往 DB content
+        # 插「—— 第 N 轮 ——」文本，与前端 live draft 的伪 text 段、终稿
+        # metadata.segments 三种形态并存。现统一为 round_boundary 段——
+        # live 由前端 beginStreamRound 插入、终稿由 build_display_segments
+        # 按 tool_turn_acc 轮号标注产出；DB content 回归纯文本兜底（重连
+        # 恢复走完整流重放或 segments，不再依赖 content 里的标记行）。
         return
 
     if event.get("type") == "text_delta" and agent._streaming_msg_id:

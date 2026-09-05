@@ -354,6 +354,60 @@ async def test_normal_completion_writes_thinking_to_tool_turn_messages():
     assert segs[1] == {"type": "text", "content": "最终答复"}
 
 
+async def test_tool_loop_annotates_rounds_for_display_segments():
+    """tool_loop 给 tool_turn_acc 元素标注产出轮号（round 字段）→
+    build_display_segments 在轮间产 round_boundary 段；且请求 messages
+    里的同一条消息不带该侧信道键（不进 LLM 请求体）。"""
+    streamer = _make_streamer()
+    provider = _FakeProvider()
+
+    captured_messages: list[list[dict]] = []
+
+    async def fake_stream(*, messages, **kwargs):
+        captured_messages.append([dict(m) for m in messages])
+        if len(captured_messages) == 1:
+            return _tool_round_result()
+        return _text_round_result("slice done")
+
+    streamer._stream_with_empty_retry = fake_stream  # type: ignore[method-assign]
+    streamer._execute_tools = AsyncMock(  # type: ignore[method-assign]
+        return_value=(
+            [{"role": "tool", "content": "ok", "tool_call_id": "tc-1"}],
+            set(),
+            set(),
+            set(),
+            False,
+        )
+    )
+
+    result = await streamer._run_tool_loop(
+        agent_id="a1",
+        provider=provider,
+        provider_name="fake",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        on_delta=None,
+        on_tool_call=AsyncMock(),
+        max_tool_rounds=10,
+    )
+
+    assert result["status"] == "ok"
+    # acc 元素带轮号：round 0 = assistant(tool_calls)+tool 结果，round 1 = 末轮文本
+    rounds = [m.get("round") for m in result["tool_turn_messages"]]
+    assert rounds == [0, 0, 1]
+    # 请求侧消息（第 2 轮收到的历史）不含展示侧信道键
+    for m in captured_messages[1]:
+        assert "round" not in m
+    # 终稿 segments：轮间恰一个 round_boundary，载荷轮号正确
+    from hiveweave.agents.completion import build_display_segments
+
+    segs = build_display_segments(result["tool_turn_messages"], result["content"], [])
+    assert [s["type"] for s in segs] == [
+        "tool_call", "round_boundary", "text",
+    ]
+    assert segs[1] == {"type": "round_boundary", "round": 1}
+
+
 async def test_length_truncation_writes_thinking_to_warning_message():
     """finish_reason=length 提前收口：截断告警消息也带本轮 thinking，
     不会因 segments 含中间轮 thinking 而把末轮思考整个隐藏。"""

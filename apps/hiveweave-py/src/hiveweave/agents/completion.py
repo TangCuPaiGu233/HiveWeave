@@ -86,11 +86,20 @@ def build_display_segments(
     - assistant(content) → text 块
     - assistant(tool_calls) → 每个调用一个 tool_call 块
     - tool 结果 → 按 tool_call_id 回填到对应块（result 截断 + ok/error）
+    - 轮次边界 → 元素带 round 标注（tool_loop _acc）时在轮与轮之间产出
+      round_boundary 段（首轮前不产），终稿与 live draft 同构
     - final_content 兜底：若末尾 text 块与之不同则追加（部分提前收口
       路径 final 不在 tool_turn_messages 里）
     """
     segs: list[dict] = []
     ok_map: dict[str, bool] = {}
+    # 轮次边界（round_boundary，2026-09-05）：tool_loop 给 tool_turn_acc
+    # 元素标注产出轮号（round 字段，0 起号，round_start 同口径）。轮号在
+    # 相邻元素间前进且 >=1 时产出边界段，终稿 segments 自此带轮次结构，
+    # 与前端 live draft（beginStreamRound 插 round_boundary）同 kind 同
+    # 渲染 —— done reload 不再丢轮次分隔。首轮（0）与无标注元素（legacy
+    # 数据 / 平台收口尾注）不产边界。
+    last_round: int | None = None
     for e in tool_history or []:
         if isinstance(e, dict) and e.get("id"):
             ok_map[str(e["id"])] = bool(e.get("ok", True))
@@ -107,6 +116,11 @@ def build_display_segments(
     for m in tool_turn_messages or []:
         if not isinstance(m, dict):
             continue
+        rnd = m.get("round")
+        if isinstance(rnd, int) and rnd != last_round:
+            if last_round is not None and rnd >= 1:
+                segs.append({"type": "round_boundary", "round": rnd})
+            last_round = rnd
         role = m.get("role")
         if role == "assistant":
             # DSH 整轮视图：每轮 reasoning 作为 thinking 块原位保留，
@@ -329,7 +343,14 @@ async def handle_completion(
                 f"Continue your work as normal."
             ),
         })
-    turn_messages.extend(tool_turn_messages)
+    # 落 conversation store 前剥除展示侧信道轮号（tool_loop _acc 标注的
+    # "round"）—— 未知键随 assistant 消息回传 LLM 会被严格网关 400
+    # （同 F8 tool 消息白名单的理由）。
+    from hiveweave.llm.streamer.tool_loop import strip_round_annotations
+
+    turn_messages.extend(
+        strip_round_annotations(tool_turn_messages)
+    )
     # Do not persist base64 screenshots into conversation history —
     # they are for the in-flight tool loop only; next turn can re-screenshot.
     from hiveweave.services.vision import messages_without_images

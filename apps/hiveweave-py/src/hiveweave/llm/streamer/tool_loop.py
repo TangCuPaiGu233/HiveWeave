@@ -162,6 +162,20 @@ def _assistant_with_reasoning(
     return msg
 
 
+def strip_round_annotations(messages: list | None) -> list[dict]:
+    """剥除 ``_acc`` 标注在 tool_turn_acc 元素上的展示侧信道轮号（"round"）。
+
+    消息落 conversation store / 回传 LLM 前必须调用 —— 未知键随 assistant
+    消息进请求体会被严格网关 400（同 F8 tool 消息白名单的理由）。
+    """
+    return [
+        {k: v for k, v in m.items() if k != "round"}
+        if isinstance(m, dict) and "round" in m
+        else m
+        for m in (messages or [])
+    ]
+
+
 class ToolLoopMixin:
     """Tool loop main cycle for Streamer."""
 
@@ -276,6 +290,19 @@ class ToolLoopMixin:
         thinking_acc = ""
         tool_history: list[dict] = []
         tool_turn_acc: list[dict] = []
+
+        # 轮次标注（round_boundary 数据源，2026-09-05）：tool_turn_acc 的
+        # 每个元素在**副本**上记录产出轮号（round_start 同款 0 起号口径）。
+        # 用副本是因为同一消息对象还会进请求 messages —— "round" 是展示
+        # 侧信道，不得进 LLM 请求体（严格网关对 assistant 消息做 schema
+        # 校验）；落 conversation store 前由 strip_round_annotations 再剥
+        # 一次（completion / recovery 持久化路径）。
+        def _acc(msg: dict) -> None:
+            tool_turn_acc.append({**msg, "round": round_num})
+
+        def _acc_extend(msgs: list[dict]) -> None:
+            tool_turn_acc.extend({**m, "round": round_num} for m in msgs)
+
         last_usage: dict | None = None
         no_text_rounds = 0
         no_text_hint_count = 0  # 无文字提示注入次数，超过 NO_TEXT_HINT_MAX 时 break
@@ -674,7 +701,7 @@ class ToolLoopMixin:
                         f"{truncated_rounds} 轮截断（工具调用参数不完整），"
                         "已丢弃未执行。请稍后重试该调用。"
                     )
-                    tool_turn_acc.append(_assistant_with_reasoning(
+                    _acc(_assistant_with_reasoning(
                         real_text + warning,
                         provider.supports_thinking,
                         new_thinking,
@@ -706,7 +733,7 @@ class ToolLoopMixin:
                     # 全部畸形：本轮文本留作中间轮，继续循环让模型看到
                     # 提示后立即重发（不走 turn 收口）。
                     if new_text:
-                        tool_turn_acc.append(_assistant_with_reasoning(
+                        _acc(_assistant_with_reasoning(
                             new_text, provider.supports_thinking, new_thinking
                         ))
                     text_acc = self._strip_placeholder(combined_text_pre)
@@ -769,7 +796,7 @@ class ToolLoopMixin:
                             finish=finish_reason)
                 real_text = self._strip_placeholder(combined_text)
                 warning = f"\n\n⚠️ 响应被截断（{finish_reason}），部分工具调用可能不完整。"
-                tool_turn_acc.append(_assistant_with_reasoning(
+                _acc(_assistant_with_reasoning(
                     real_text + warning, provider.supports_thinking, new_thinking
                 ))
                 return {
@@ -787,7 +814,7 @@ class ToolLoopMixin:
                 log.warning("response_truncated_length", round=round_num)
                 real_text = self._strip_placeholder(combined_text)
                 warning = "\n\n⚠️ 回复被截断（达到最大输出长度），请继续以完成。"
-                tool_turn_acc.append(_assistant_with_reasoning(
+                _acc(_assistant_with_reasoning(
                     real_text + warning, provider.supports_thinking, new_thinking
                 ))
                 return {
@@ -805,7 +832,7 @@ class ToolLoopMixin:
                 log.warning("content_filtered", round=round_num)
                 real_text = self._strip_placeholder(combined_text)
                 warning = "\n\n⚠️ 回复被内容过滤器截断。"
-                tool_turn_acc.append(_assistant_with_reasoning(
+                _acc(_assistant_with_reasoning(
                     real_text + warning, provider.supports_thinking, new_thinking
                 ))
                 return {
@@ -874,7 +901,7 @@ class ToolLoopMixin:
                         }
                         if provider.supports_thinking and new_thinking:
                             doom_assistant_msg["reasoning_content"] = new_thinking
-                        tool_turn_acc.append(doom_assistant_msg)
+                        _acc(doom_assistant_msg)
                         for tc in tool_calls:
                             tool_history.append({
                                 "id": tc["id"],
@@ -898,7 +925,7 @@ class ToolLoopMixin:
                             for tc in tool_calls
                         ]
                         messages = messages + [doom_assistant_msg] + tool_results
-                        tool_turn_acc.extend(tool_results)
+                        _acc_extend(tool_results)
                         # 重置 tracker，给 LLM 一轮纠正机会
                         doom_tracker = {"last_key": None, "count": 0}
                         # 累积文本和 thinking
@@ -984,7 +1011,7 @@ class ToolLoopMixin:
                 if provider.supports_thinking and new_thinking:
                     assistant_msg["reasoning_content"] = new_thinking
 
-                tool_turn_acc.append(assistant_msg)
+                _acc(assistant_msg)
 
                 # 累积 tool_history
                 for tc in tool_calls:
@@ -1044,7 +1071,7 @@ class ToolLoopMixin:
 
                 # 追加 assistant + tool_results 到 messages
                 messages = messages + [assistant_msg] + tool_results
-                tool_turn_acc.extend(tool_results)
+                _acc_extend(tool_results)
 
                 # BUG-3: commit_turn accepted → hard-stop tool loop (no next LLM round)
                 if end_turn:
@@ -1275,9 +1302,7 @@ class ToolLoopMixin:
                             )
                     # 本轮 assistant_msg（含 reasoning_content）已在上方
                     # append（line 847），此处只追加 summary 文本，不重复附 thinking。
-                    tool_turn_acc.append(
-                        {"role": "assistant", "content": final_text}
-                    )
+                    _acc({"role": "assistant", "content": final_text})
                     return {
                         "status": "ok",
                         "content": final_text,
@@ -1338,7 +1363,7 @@ class ToolLoopMixin:
                         messages.append(
                             {"role": "system", "content": " ".join(_adv_hits)}
                         )
-                        tool_turn_acc.append(
+                        _acc(
                             {"role": "assistant", "content": " ".join(_adv_hits)}
                         )
 
@@ -1362,9 +1387,7 @@ class ToolLoopMixin:
                             final_text = self._strip_placeholder(summary)
                             # 本轮 assistant_msg 已含 reasoning_content（line 847），
                             # 此处不重复附 thinking。
-                            tool_turn_acc.append(
-                                {"role": "assistant", "content": final_text}
-                            )
+                            _acc({"role": "assistant", "content": final_text})
                             return {
                                 "status": "ok",
                                 "content": final_text,
@@ -1423,7 +1446,7 @@ class ToolLoopMixin:
             final_msg = _assistant_with_reasoning(
                 final_text, provider.supports_thinking, new_thinking
             )
-            tool_turn_acc.append(final_msg)
+            _acc(final_msg)
 
             log.info("stream_complete",
                      agent_id=agent_id,

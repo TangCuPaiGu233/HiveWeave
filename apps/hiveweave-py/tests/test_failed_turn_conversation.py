@@ -160,8 +160,8 @@ async def test_persist_partial_turn_keeps_mid_round_messages():
         "status": "error",
         "content": "已完成的半截分析",
         "tool_turn_messages": [
-            {"role": "assistant", "content": "第一步", "tool_calls": []},
-            {"role": "tool", "content": "结果", "tool_call_id": "t1"},
+            {"role": "assistant", "content": "第一步", "tool_calls": [], "round": 0},
+            {"role": "tool", "content": "结果", "tool_call_id": "t1", "round": 0},
         ],
     }
     persisted = await persist_partial_turn(agent, partial)
@@ -171,6 +171,8 @@ async def test_persist_partial_turn_keeps_mid_round_messages():
     assert USER_TEXT in conv.turns[0]["content"]
     assert conv.turns[1]["content"] == "第一步"
     assert conv.turns[2]["content"] == "结果"
+    # 展示侧信道轮号剥除（落 conversation store 的消息不进 LLM 请求体带脏键）
+    assert all("round" not in m for m in conv.turns)
     # 断流标记带 FAILED_TURN_MARKER，供 history_ends_with_failed_turn 识别
     assert conv.turns[3]["content"].startswith(FAILED_TURN_MARKER)
     assert "[TURN INTERRUPTED]" in conv.turns[3]["content"]

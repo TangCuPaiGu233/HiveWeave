@@ -1,6 +1,15 @@
 import { useState, useEffect, useCallback } from "react";
-import { getAgent, updateAgent, getPermissionRules, getModels } from "../api";
-import type { LlmModel } from "../api";
+import {
+  getAgent,
+  updateAgent,
+  getPermissionRules,
+  getModels,
+  getMcpServers,
+  bindAgentMcp,
+  unbindAgentMcp,
+} from "../api";
+import type { LlmModel, McpServer } from "../api";
+import ConfirmDialog from "./ConfirmDialog";
 import { useAppStore } from "../store";
 
 // Safely parse a JSON array field that may be a string, array, or null.
@@ -94,6 +103,10 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
   const [saving, setSaving] = useState(false);
   const [models, setModels] = useState<LlmModel[]>([]);
   const [resolvedModel, setResolvedModel] = useState<{ modelName: string; modelId: string } | null>(null);
+  // MCP 服务器管理：全部已配置 server（绑定下拉用）+ 解绑确认
+  const [allMcpServers, setAllMcpServers] = useState<McpServer[]>([]);
+  const [mcpBusy, setMcpBusy] = useState(false);
+  const [pendingUnbind, setPendingUnbind] = useState<string | null>(null);
 
   const refreshOrgTree = useAppStore((s) => s.refreshOrgTree);
   const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
@@ -175,6 +188,11 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
     getModels().then(setModels).catch(() => {});
   }, []);
 
+  // Load configured MCP servers (for the bind dropdown)
+  useEffect(() => {
+    getMcpServers().then(setAllMcpServers).catch(() => {});
+  }, []);
+
   // Change agent model
   const changeModel = async (modelId: string) => {
     if (!agent) return;
@@ -205,6 +223,36 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
     }
   };
 
+  // Bind an MCP server to this agent
+  const handleBindMcp = async (server: string) => {
+    if (!agent || !server || mcpBusy) return;
+    setMcpBusy(true);
+    try {
+      await bindAgentMcp(agent.id, server);
+      setAgent({ ...agent, mcpServers: [...agent.mcpServers, server] });
+      refreshOrgTree();
+    } catch (err: any) {
+      setError(`绑定 MCP 失败: ${err.message}`);
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  // Unbind an MCP server (called after ConfirmDialog confirms)
+  const handleUnbindMcp = async (server: string) => {
+    if (!agent || mcpBusy) return;
+    setMcpBusy(true);
+    try {
+      await unbindAgentMcp(agent.id, server);
+      setAgent({ ...agent, mcpServers: agent.mcpServers.filter((s) => s !== server) });
+      refreshOrgTree();
+    } catch (err: any) {
+      setError(`解绑 MCP 失败: ${err.message}`);
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="h-full flex items-center justify-center text-g-fg-4">
@@ -230,6 +278,9 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
   }
 
   const statusConfig = STATUS_CONFIG[agent.status] || STATUS_CONFIG.created;
+  const availableMcpServers = allMcpServers.filter(
+    (s) => !agent.mcpServers.includes(s.name),
+  );
   const isProcessing = processingAgents.includes(agentId);
   // Override status display for "active" agents based on runtime processing state
   const runtimeStatus = agent.status === "active"
@@ -463,15 +514,41 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                 <label className="text-xs font-medium text-g-fg-3 mb-1 block">MCP 服务器</label>
                 <div className="flex flex-wrap gap-1">
                   {agent.mcpServers.length > 0 ? (
-                    agent.mcpServers.map((s, i) => (
-                      <span key={i} className="px-2 py-0.5 text-[10px] bg-g-blue-bg text-g-blue rounded-gm">
+                    agent.mcpServers.map((s) => (
+                      <span
+                        key={s}
+                        className="px-2 py-0.5 text-[10px] bg-g-blue-bg text-g-blue rounded-gm inline-flex items-center gap-1"
+                      >
                         {s}
+                        <button
+                          onClick={() => setPendingUnbind(s)}
+                          disabled={mcpBusy}
+                          title={`解绑 ${s}`}
+                          className="text-g-blue/60 hover:text-red-600 transition-colors disabled:opacity-50"
+                        >
+                          ×
+                        </button>
                       </span>
                     ))
                   ) : (
                     <span className="text-xs text-g-fg-4">未绑定</span>
                   )}
                 </div>
+                <select
+                  value=""
+                  onChange={(e) => { if (e.target.value) handleBindMcp(e.target.value); }}
+                  disabled={mcpBusy}
+                  className="mt-1.5 w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-lg text-g-fg focus:outline-none focus:border-g-blue disabled:opacity-50"
+                >
+                  <option value="">
+                    + 绑定{availableMcpServers.length === 0 ? "（暂无已配置的服务器）" : " MCP 服务器"}
+                  </option>
+                  {availableMcpServers.map((s) => (
+                    <option key={s.name} value={s.name}>
+                      {s.name}（{s.transport}{s.enabled ? "" : "，已禁用"}）
+                    </option>
+                  ))}
+                </select>
               </div>
               <div>
                 <div className="flex items-center justify-between gap-2 mb-1">
@@ -536,6 +613,21 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
           </div>
         </section>
       </div>
+
+      {/* 解绑 MCP 确认弹窗 */}
+      {pendingUnbind !== null && (
+        <ConfirmDialog
+          title="解绑 MCP 服务器"
+          message={`确定解绑「${pendingUnbind}」？解绑后该 Agent 将无法使用其工具。`}
+          danger
+          onConfirm={() => {
+            const server = pendingUnbind;
+            setPendingUnbind(null);
+            if (server) handleUnbindMcp(server);
+          }}
+          onCancel={() => setPendingUnbind(null)}
+        />
+      )}
     </div>
   );
 }

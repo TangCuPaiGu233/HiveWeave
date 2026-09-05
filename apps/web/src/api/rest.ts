@@ -327,6 +327,81 @@ export async function updateSettings(settings: Record<string, string>) {
 }
 
 // ---------------------------------------------------------------------------
+// MCP servers — 服务器配置 + agent 绑定
+// ---------------------------------------------------------------------------
+
+export interface McpServer {
+  id: string;
+  name: string;
+  transport: "http" | "stdio";
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  url: string;
+  enabled: boolean;
+  createdAt?: number | null;
+}
+
+export interface McpServerUpsertInput {
+  name: string;
+  transport: "http" | "stdio";
+  command?: string;
+  url?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  enabled?: boolean;
+}
+
+export async function getMcpServers(): Promise<McpServer[]> {
+  const data = await fetchJSON<{ servers: McpServer[] }>(`${BASE}/mcp/servers`);
+  return data?.servers ?? [];
+}
+
+/** 新增或更新 MCP 服务器（后端 upsert 语义，按 name 覆盖）。 */
+export async function addMcpServer(input: McpServerUpsertInput) {
+  return fetchJSON(`${BASE}/mcp/servers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function removeMcpServer(name: string) {
+  return fetchJSON(`${BASE}/mcp/servers/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+}
+
+/** 列出某 MCP 服务器的工具；离线/连接失败时后端返回 503（throw）。 */
+export async function getMcpServerTools(name: string) {
+  return fetchJSON(`${BASE}/mcp/servers/${encodeURIComponent(name)}/tools`);
+}
+
+/** agent 已绑定的 MCP 服务器名列表。 */
+export async function getAgentMcp(agentId: string): Promise<string[]> {
+  const data = await fetchJSON<{ servers: string[] }>(
+    `${BASE}/mcp/agents/${encodeURIComponent(agentId)}`,
+  );
+  return data?.servers ?? [];
+}
+
+export async function bindAgentMcp(agentId: string, server: string) {
+  return fetchJSON(`${BASE}/mcp/agents/${encodeURIComponent(agentId)}/bind`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ server }),
+  });
+}
+
+export async function unbindAgentMcp(agentId: string, server: string) {
+  return fetchJSON(`${BASE}/mcp/agents/${encodeURIComponent(agentId)}/unbind`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ server }),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Models
 // ---------------------------------------------------------------------------
 

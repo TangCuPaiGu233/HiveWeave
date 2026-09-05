@@ -1848,6 +1848,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["agentId"],
     },
+    "list_available_mcp": {
+        "description": (
+            "List MCP servers configured for this project (name / "
+            "transport / enabled). Read-only directory — binding is done "
+            "in Settings or via the operator."
+        ),
+        "properties": {},
+        "required": [],
+    },
     "get_platform_state": {
         "description": (
             "Read-only platform ground truth (gates, ledger, org, runtime) "
@@ -2528,6 +2537,70 @@ class ToolExecutor:
             return None
         return build_unknown_tool_error(name, known)
 
+    async def _execute_mcp_tool(
+        self,
+        agent_id: str,
+        public_name: str,
+        tool_args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """mcp__<server>__<raw> 分流执行（45 轮 #9 MCP 接线）。
+
+        顺序对齐 DSH：可达性（表反解）→ 绑定 → 权限（通用 matrix：硬门
+        与 denied/ask glob 在 evaluate_detailed 里已先行）→ call_tool。
+        表 miss 时先按需重同步一次再判，server 降级给可操作文案。
+        """
+        from hiveweave.services import mcp_supervisor
+        from hiveweave.services.mcp import mcp_service
+
+        entry = mcp_supervisor.get_tool_entry(public_name)
+        if entry is None:
+            await mcp_supervisor.ensure_agent_tools_synced(agent_id)
+            entry = mcp_supervisor.get_tool_entry(public_name)
+        if entry is None:
+            return self._error(
+                f"Unknown MCP tool '{public_name}' — server not synced or "
+                "degraded (tools invisible). Check the MCP server status "
+                "and the agent's binding. "
+                "RETRY[action=check_mcp_server_and_binding]"
+            )
+        if not await mcp_supervisor.agent_can_use(agent_id, public_name):
+            return self._error(
+                f"MCP tool '{public_name}' belongs to server "
+                f"'{entry.server}', which is not bound to this agent. "
+                "RETRY[action=bind_mcp_server_via_settings]"
+            )
+        decision, reason = await self.permission.evaluate_detailed(
+            agent_id, public_name, tool_args
+        )
+        if decision == "deny":
+            log.info(
+                "mcp_tool_denied",
+                agent_id=agent_id,
+                tool=public_name,
+                reason=(reason or "")[:200],
+            )
+            return self._error(
+                f"[PERMISSION DENY] {reason or 'denied by policy'}"
+            )
+        if decision == "ask":
+            # MCP 调用暂无审批通道（stdio/http 直连）：ask 规则按无人值守
+            # 语义确定性拒绝并指路（对齐 command_guard unattended 处理）。
+            return self._error(
+                f"[ASK RULE] '{public_name}' is configured as ask — MCP "
+                "tools have no approval channel. Remove the ask rule or "
+                "deny explicitly. RETRY[action=adjust_ask_tools_config]"
+            )
+        try:
+            output = await mcp_service.call_tool(
+                entry.server, entry.raw_name, tool_args
+            )
+        except Exception as e:  # noqa: BLE001 — 下游错误转回执不炸父
+            return self._error(
+                f"MCP call failed on '{public_name}': "
+                f"{type(e).__name__}: {e}"
+            )
+        return {"success": True, "output": output, "error": None}
+
     @staticmethod
     def audit_registered_tools() -> list[dict]:
         """F3 死工具对账：注册清单 ↔ 可调用实现。
@@ -2586,6 +2659,25 @@ class ToolExecutor:
 
         log.info("tool.execute", agent_id=agent_id, tool=name,
                  args_preview=str(tool_args)[:200])
+
+        # ── 1.1 MCP 工具分流（45 轮 #9）──────────────────────
+        # mcp__<server>__<raw> 名不在 @tool 注册表——必须先于未知工具
+        # fast-fail 分流。绑定即用 + 通用门禁（硬门/denied/ask glob 与
+        # 绑定校验在 _execute_mcp_tool 内，无 MCP 特殊权限分支）。
+        if name.startswith("mcp__"):
+            result = await self._execute_mcp_tool(agent_id, name, tool_args)
+            result = await _f10_result_hooks(result, name, tool_args, agent_id)
+            if result.get("output"):
+                result["output"] = self._maybe_save_large_output(
+                    result["output"], agent_id, name, workspace_path
+                )
+            # 与 registered 路径同漏斗（审计 L2）：pending 兑现回填 +
+            # TOOL_EXECUTE_AFTER 钩子，未来新 handler 不对 MCP 调用隐身
+            await _f10_pending_success_backfill(
+                result, name, tool_args, agent_id
+            )
+            await _emit_tool_execute_after(agent_id, name, tool_args, result)
+            return result
 
         # ── 1.2 未知工具 fast-fail（必须早于权限评估）────────
         # DSH_33 实测：19 次模型幻觉工具名（self.bash / self.get_tasks …）

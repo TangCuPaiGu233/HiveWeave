@@ -16,6 +16,7 @@ import structlog
 
 from hiveweave.api.health import router as health_router
 from hiveweave.api.settings import router as settings_router
+from hiveweave.api.mcp import router as mcp_router
 from hiveweave.api.models import router as models_router
 from hiveweave.api.provider_presets import router as provider_presets_router
 from hiveweave.api.templates import router as templates_router
@@ -41,6 +42,7 @@ log = structlog.get_logger(__name__)
 _SUB_ROUTERS = [
     health_router,
     settings_router,
+    mcp_router,  # /api/mcp — MCP 服务器配置 CRUD + agent 绑定
     models_router,
     provider_presets_router,  # /api/provider-presets — 知名服务商预设（只填 Key）
     templates_router,

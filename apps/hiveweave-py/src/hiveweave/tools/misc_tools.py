@@ -2140,3 +2140,33 @@ async def webfetch_tool(
             f"Prompt: {prompt}\n\n{text}"
         )
     return ToolResult.ok(text)
+
+
+# ── list_available_mcp（45 轮 #9 悬空引用修复）──────────────
+# coordinator.py:384/409 早就在让 HR 调这个工具名，但实现只存在于
+# services/mcp.py:497 且从未注册——HR 照提示调用必被未知工具 fast-fail。
+# 薄注册：直接透传 McpService.list_available_mcp() 的格式化文本。
+
+
+class ListAvailableMcpParams(BaseModel):
+    """list_available_mcp takes no parameters."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+@tool(
+    "list_available_mcp",
+    "List MCP servers configured for this project (name / transport / "
+    "enabled). Read-only directory — binding is done in Settings or via "
+    "the operator.",
+    requires_workspace=False,
+    security_level="read",
+)
+async def list_available_mcp_tool(
+    params: ListAvailableMcpParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    """List configured MCP servers (formatted text directory)."""
+    from hiveweave.services.mcp import mcp_service
+
+    text = await mcp_service.list_available_mcp()
+    return ToolResult.ok(text or "(no MCP servers configured)")

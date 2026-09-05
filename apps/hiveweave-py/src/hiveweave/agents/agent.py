@@ -1804,7 +1804,38 @@ class Agent:
         # 不进模型工具表 —— custom 模式的存量 allowed_tools 也一并过滤。
         from hiveweave.services.host_env import filter_tools_for_host
 
-        return _build_tool_definitions(filter_tools_for_host(tool_names))
+        visible_names = filter_tools_for_host(tool_names)
+
+        # MCP 绑定即用（45 轮 #9）：绑定的 server 工具按公开名追加进
+        # 工具表（schema 来自 tools/list 原样透传）。best-effort：supervisor
+        # 失败/降级 → 该 server 工具静默不可见；执行层再按绑定二次校验。
+        mcp_defs: list[dict] = []
+        try:
+            from hiveweave.services import mcp_supervisor
+
+            await mcp_supervisor.ensure_agent_tools_synced(self.id)
+            bound = await mcp_supervisor.agent_bound_servers(self.id)
+            for server in bound:
+                for public_name in mcp_supervisor.server_tool_names(server):
+                    entry = mcp_supervisor.get_tool_entry(public_name)
+                    if entry is None:
+                        continue
+                    mcp_defs.append({
+                        "type": "function",
+                        "function": {
+                            "name": public_name,
+                            "description": entry.description
+                            or f"MCP tool {entry.raw_name} on server {server}.",
+                            "parameters": entry.input_schema
+                            or {"type": "object", "additionalProperties": True},
+                        },
+                    })
+        except Exception as mcp_err:  # noqa: BLE001 — fail-open
+            log.debug("mcp_tool_defs_skip", agent_id=self.id, error=str(mcp_err))
+
+        # KV 前缀纪律（审计 L4）：mcp 段按公开名字典序，绑定/解绑不改顺序
+        mcp_defs.sort(key=lambda d: d["function"]["name"])
+        return _build_tool_definitions(visible_names) + mcp_defs
 
     def _get_max_tool_rounds(self) -> int:
         """获取 tool loop 最大轮次。所有角色统一 600 次。"""

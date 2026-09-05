@@ -160,6 +160,9 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     # Seedream text-to-image — source-writing roles only (not CEO/HR)
     "generate_image": frozenset({Capability.SOURCE_WRITE}),
     "spawn_subagent": frozenset({Capability.SOURCE_WRITE}),
+    # 45 轮 #9：MCP 目录只读——仅 HR（能力矩阵里 STAFFING 只有 hr 族有；
+    # coordinator 族无）。调用方是 HR 招聘提示（coordinator.py:384/409）。
+    "list_available_mcp": frozenset({Capability.STAFFING}),
     # DOC_WRITE agents (CEO) may edit docs; SOURCE_WRITE covers all paths
     "edit_file": frozenset({Capability.SOURCE_WRITE, Capability.DOC_WRITE}),
     "apply_patch": frozenset({Capability.SOURCE_WRITE}),

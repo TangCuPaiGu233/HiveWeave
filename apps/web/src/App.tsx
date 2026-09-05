@@ -18,6 +18,7 @@ const FolderPicker = lazyRetry(() => import("./components/FolderPicker"));
 const OfficeView = lazyRetry(() => import("./components/OfficeView"));
 const ModelConfigPage = lazyRetry(() => import("./components/ModelConfigPage"));
 const ApiKeyDialog = lazyRetry(() => import("./components/ApiKeyDialog"));
+const SettingsPanel = lazyRetry(() => import("./components/SettingsPanel"));
 const GoalsPanel = lazyRetry(() => import("./components/GoalsPanel"));
 const QuestionDialog = lazyRetry(() => import("./components/QuestionDialog"));
 const NewProjectDialog = lazyRetry(() => import("./components/NewProjectDialog"));
@@ -64,6 +65,7 @@ function App() {
   });
   const [showModelConfig, setShowModelConfig] = useState(false);
   const [showApiKeyDialog, setShowApiKeyDialog] = useState(false);
+  const [showMcpPanel, setShowMcpPanel] = useState(false);
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
   const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ id: string; name: string } | null>(null);
@@ -616,6 +618,16 @@ function App() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a4 4 0 11-8 0 4 4 0 018 0zM12 15v6m-3-3h6" />
             </svg>
           </button>
+          {/* MCP 服务器管理 */}
+          <button
+            onClick={() => setShowMcpPanel(true)}
+            className="text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg/60 rounded-full p-1.5 transition-all active:scale-90"
+            title="MCP 服务器"
+          >
+            <svg className="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+          </button>
           {/* Editable user name */}
           {editingName ? (
             <input
@@ -859,6 +871,10 @@ function App() {
 
         {showApiKeyDialog && (
           <ApiKeyDialog onClose={() => setShowApiKeyDialog(false)} />
+        )}
+
+        {showMcpPanel && (
+          <SettingsPanel onClose={() => setShowMcpPanel(false)} />
         )}
 
         {confirmDelete && (

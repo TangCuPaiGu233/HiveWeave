@@ -102,6 +102,7 @@ HR_TOOLS = _BASE_TOOLS | frozenset({
     "hire_agent", "dismiss_agent", "transfer_agent",
     "list_agent_templates",
     "bind_skill", "unbind_skill",
+    "list_available_mcp",
     "write_file",
 })
 
@@ -209,6 +210,21 @@ class PermissionService:
             return "ask", None
         if self._matches_pattern(tool_name, allowed, tool_args):
             return "allow", None
+
+        # MCP 绑定即用（45 轮 #9）：mcp__ 工具不在任何家族预设里——按
+        # agent 绑定判定（server 绑定 + 工具表在册）。硬门与 denied/ask
+        # glob 已在上文先生效，无 MCP 特殊权限分支（mcp__ 只是名字形状，
+        # denied_tools 可按 `mcp__server__*` glob 配置）。
+        if tool_name.startswith("mcp__"):
+            from hiveweave.services import mcp_supervisor
+
+            if await mcp_supervisor.agent_can_use(agent_id, tool_name):
+                return "allow", None
+            return (
+                "deny",
+                f"MCP tool '{tool_name}' is not bound to this agent "
+                "(bind the MCP server first, or check server degraded state)",
+            )
 
         family = infer_role_family(agent)
         permission_type = (agent.get("permission_type") or "").lower()

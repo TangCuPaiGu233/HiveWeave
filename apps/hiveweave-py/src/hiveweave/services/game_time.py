@@ -397,6 +397,17 @@ class GameTimeService:
         except Exception as e:
             log.warning("wait_recovery_on_start_failed",
                         project_id=project_id, error=str(e))
+        # 团队开会恢复泵（与 recover_wait_timeouts 同槽位：lifespan /
+        # activate / tick；幂等，恢复 hold / 补弃权 / 重投 RESULT）
+        try:
+            from hiveweave.services.meetings.orchestrator import (
+                recover_meetings,
+            )
+
+            await recover_meetings(project_id)
+        except Exception as e:
+            log.warning("meeting_recovery_on_start_failed",
+                        project_id=project_id, error=str(e))
         # 根因修复：game_time 启动时立即扫一次 streaming zombie，
         # 不等 30s tick。项目未激活期间 game_time 不运行，zombie
         # 会持续存在；激活后应立即清理而非等待首个扫描周期
@@ -526,6 +537,17 @@ class GameTimeService:
             await self._process_wait_contracts(project_id)
         except Exception as e:
             log.error("wait_contract_tick_failed", project_id=project_id, error=str(e))
+        # 团队开会恢复泵（lifespan / activate / tick 同槽位；tick 上幂等）：
+        # 恢复 hold、补 collecting 未发言者为弃权、重唤主持、重试 RESULT。
+        try:
+            from hiveweave.services.meetings.orchestrator import (
+                recover_meetings,
+            )
+
+            await recover_meetings(project_id)
+        except Exception as e:
+            log.error("meeting_recovery_tick_failed",
+                      project_id=project_id, error=str(e))
         # Auto-heal: clear orphan streaming messages (agent idle but is_streaming=1)
         if state["tick_count"] % STREAMING_SWEEP_TICKS == 0:
             await self._sweep_orphan_streaming(project_id)

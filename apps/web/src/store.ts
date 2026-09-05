@@ -61,6 +61,29 @@ export interface AgentActiveModelInfo {
   at: number;
 }
 
+/**
+ * 团队开会状态（docs/spec/team-meeting.md §前端）：由 lobby
+ * "meeting_updated" 事件驱动，按 seq 幂等合并（at-least-once 语义）。
+ * ChatPanel 状态条 / OrgTree 开会徽标只读此字段；会务流不进 chatSessions。
+ */
+export interface MeetingStatusInfo {
+  meetingId: string;
+  projectId: string;
+  status: "assembling" | "collecting" | "facilitating" | "concluded" | "aborted";
+  topicIndex: number;
+  roundIndex: number;
+  title?: string;
+  seq: number;
+  updatedAt: number;
+}
+
+/** 会议仍占锁的状态（ChatPanel 状态条 / OrgTree 徽标的显示条件）。 */
+export const MEETING_ACTIVE_STATUSES = new Set([
+  "assembling",
+  "collecting",
+  "facilitating",
+]);
+
 interface AppState {
   selectedAgentId: string | null;
   setSelectedAgent: (id: string | null) => void;
@@ -124,6 +147,9 @@ interface AppState {
   // Agent active model — live "model_resolved" events track actual model in use
   agentActiveModel: Record<string, AgentActiveModelInfo>;
   setAgentActiveModel: (agentId: string, info: AgentActiveModelInfo | null) => void;
+  // 团队开会 — lobby "meeting_updated"（seq 幂等合并；见 MeetingStatusInfo）
+  activeMeeting: MeetingStatusInfo | null;
+  setActiveMeeting: (info: MeetingStatusInfo | null) => void;
   // Pending initial message — set by NewProjectDialog, consumed by ChatPanel on mount
   pendingInitialMessage: { agentId: string; message: string } | null;
   setPendingInitialMessage: (msg: { agentId: string; message: string } | null) => void;
@@ -370,6 +396,25 @@ export const useAppStore = create<AppState>((set, get) => ({
   // Pending initial message
   pendingInitialMessage: null,
   setPendingInitialMessage: (msg) => set({ pendingInitialMessage: msg }),
+  // 团队开会状态（meeting_updated → addActivity 拦截写入）
+  activeMeeting: null,
+  setActiveMeeting: (info) =>
+    set((state) => {
+      if (info === null) {
+        return state.activeMeeting === null ? state : { activeMeeting: null };
+      }
+      const prev = state.activeMeeting;
+      // seq 幂等：同会议旧 seq / 同 seq 重复事件不合并（at-least-once）
+      if (
+        prev &&
+        prev.meetingId === info.meetingId &&
+        (info.seq < prev.seq ||
+          (info.seq === prev.seq && info.status === prev.status))
+      ) {
+        return state;
+      }
+      return { activeMeeting: info };
+    }),
   // Live Activity: external immutable array triggers React re-render
   activityFeed: [],
   // Internal mutable buffer — deltas accumulate here without triggering React
@@ -419,6 +464,25 @@ export const useAppStore = create<AppState>((set, get) => ({
           source: String(ev.source ?? "tier_resolved"),
           failedModel: ev.failedModel ? String(ev.failedModel) : undefined,
           at: Date.now(),
+        });
+      }
+      return;
+    }
+
+    // Intercept "meeting_updated" — 团队开会状态（seq 幂等合并，不进活动流）
+    if (rawEvent?.type === "meeting_updated") {
+      const ev = rawEvent as any;
+      const meetingId = ev.meetingId;
+      if (typeof meetingId === "string" && meetingId) {
+        get().setActiveMeeting({
+          meetingId,
+          projectId: String(ev.projectId ?? ev.project_id ?? ""),
+          status: ev.status,
+          topicIndex: Number(ev.topicIndex ?? ev.topic_index ?? 0),
+          roundIndex: Number(ev.roundIndex ?? ev.round_index ?? 0),
+          title: typeof ev.title === "string" ? ev.title : undefined,
+          seq: Number(ev.seq ?? 0),
+          updatedAt: Date.now(),
         });
       }
       return;

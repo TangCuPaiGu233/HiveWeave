@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { getAgent, deleteAgent } from "../api";
-import { useAppStore } from "../store";
+import { getAgent, deleteAgent, getActiveMeeting } from "../api";
+import { useAppStore, MEETING_ACTIVE_STATUSES } from "../store";
 import ApprovalDialog from "./ApprovalDialog";
 import TodoBar from "./TodoBar";
 import { getRoleStyle, getPositionLabel } from "../utils/role-styles";
@@ -303,9 +303,71 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     handleKeyDown,
   } = sendApi;
 
+  // ── 团队开会状态条（docs/spec/team-meeting.md §前端）──────────
+  // WS meeting_updated 驱动 store.activeMeeting；REST 仅在挂载/切项目时
+  // 水合一次（议题总数 + 初始状态）。会务流不进 chatSessions。
+  const activeMeeting = useAppStore((s) => s.activeMeeting);
+  const selectedProjectId = useAppStore((s) => s.selectedProjectId);
+  const [meetingTopicCount, setMeetingTopicCount] = useState<{
+    id: string;
+    count: number;
+  } | null>(null);
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    let cancelled = false;
+    getActiveMeeting(selectedProjectId)
+      .then((res) => {
+        if (cancelled || !res.meeting) return;
+        setMeetingTopicCount({
+          id: res.meeting.id,
+          count: (res.meeting.topics || []).length,
+        });
+        useAppStore.getState().setActiveMeeting({
+          meetingId: res.meeting.id,
+          projectId: selectedProjectId,
+          status: res.meeting.status,
+          topicIndex: res.meeting.topicIndex,
+          roundIndex: res.meeting.roundIndex,
+          title: res.meeting.title,
+          seq: 0,
+          updatedAt: Date.now(),
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProjectId]);
+
+  const showMeetingBar =
+    activeMeeting !== null &&
+    MEETING_ACTIVE_STATUSES.has(activeMeeting.status) &&
+    (!activeMeeting.projectId ||
+      activeMeeting.projectId === selectedProjectId);
+  const barTopicCount =
+    meetingTopicCount && activeMeeting && meetingTopicCount.id === activeMeeting.meetingId
+      ? meetingTopicCount.count
+      : null;
+
   return (
     <div className="h-full flex flex-col bg-white" style={hidden ? { display: "none" } : undefined}>
       <ChatMotionStyles />
+      {showMeetingBar && activeMeeting && (
+        <div
+          data-testid="meeting-status-bar"
+          className="px-4 py-1.5 border-b border-g-border bg-amber-50 text-xs text-amber-800 flex items-center gap-2 shrink-0"
+        >
+          <span className="font-semibold shrink-0">开会中</span>
+          {activeMeeting.title ? (
+            <span className="truncate">{activeMeeting.title}</span>
+          ) : null}
+          <span className="ml-auto shrink-0 tabular-nums">
+            {activeMeeting.status === "assembling"
+              ? "集合中…"
+              : `议题 ${(activeMeeting.topicIndex || 0) + 1}${barTopicCount ? `/${barTopicCount}` : ""} · 第 ${activeMeeting.roundIndex || 1}/3 轮`}
+          </span>
+        </div>
+      )}
       {agentInfo && (
         <div className="px-4 py-3 border-b border-g-border shrink-0 bg-white">
           <div className="flex items-center gap-3">

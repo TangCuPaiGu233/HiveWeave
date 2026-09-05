@@ -583,6 +583,23 @@ class OrgService:
                 error=str(e),
             )
 
+        # 团队开会钩子（docs/spec/team-meeting.md §卡住、解散）：
+        # 主席 dismiss → 会议 abort(chair_dismissed)；参会者 dismiss →
+        # 弃权 + 移出名册；活着的人（含主席）<2 → abort(roster_lt2)。
+        try:
+            from hiveweave.services.meetings.orchestrator import (
+                handle_agent_dismissed,
+            )
+
+            await handle_agent_dismissed(project_id, agent_id)
+        except Exception as e:
+            log.warning(
+                "dismiss_meeting_hook_failed",
+                project_id=project_id,
+                agent_id=agent_id,
+                error=str(e),
+            )
+
         parent_id = agent_before.get("parent_id") or ""
         # Resolve grandparent once — used when reassign would make
         # assignee==reviewer (common: parent was already pinned reviewer).

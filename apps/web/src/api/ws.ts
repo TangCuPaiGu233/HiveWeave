@@ -496,6 +496,14 @@ export function subscribeAgentStatus(
     }
   });
 
+  // meeting_updated — 团队开会状态迁移（at-least-once + seq 幂等，store 侧
+  // 合并；ChatPanel/OrgTree 只读状态条，会务 delta 不进 chatSessions）。
+  channel.on("meeting_updated", (payload: Record<string, unknown>) => {
+    if (onActivity && typeof payload.meetingId === "string") {
+      onActivity(payload as any);
+    }
+  });
+
   // task_event — 任务失效信号（不走 onActivity；前端只做"该刷新了"的标记，
   // 真正的数据走 REST 聚合端点）。载荷为 snake_case（后端原样透传）。
   channel.on("task_event", (payload: Record<string, unknown>) => {

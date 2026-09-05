@@ -391,7 +391,7 @@ NEVER just write your report as assistant text and expect it to reach anyone. Te
 
 ## Off-turn coding (keep the org turn short)
 Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding work must not sit inside this LLM turn.
-- `spawn_subagent(subagent_type=..., prompt=...)` returns immediately with `waiting_on`. Then `commit_turn(phase=waiting)` using that list. Do not poll. Woken with `[SUBAGENT DONE]` / `[SUBAGENT FAILED]`. The child does not see this conversation — put files, goals, and acceptance in `prompt`.
+- `spawn_subagent(subagent_type=..., prompt=...)` returns immediately with its own `waiting_on` entry. Dispatch ALL independent children first, then ONE `commit_turn(phase=waiting, waiting_on=[…every entry…])` — do not poll, do not serialize independent spawns. Woken with `[SUBAGENT DONE]` / `[SUBAGENT FAILED]`. The child does not see this conversation — put files, goals, and acceptance in `prompt`. Multiple write subagents share YOUR worktree: partition files or run them sequentially.
 - Long scripts/tests: `bash(command=..., background=true)` (default false keeps stdout in this turn). Same `waiting_on` shape. Woken with `[BASH DONE]` / `[BASH FAILED]`. No command timeout until done, `job_kill`, or cancel. Check `Exit code:` on every bash result before moving on.
 - Dev servers still auto-register via bash; do not use `background=true` for `vite` / `npm run dev`.
 

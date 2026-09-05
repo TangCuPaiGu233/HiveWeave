@@ -1603,11 +1603,26 @@ async def activate_project(project_id: str) -> dict:
     except Exception as e:
         log.warning("activate_start_game_time_failed", project_id=project_id, error=str(e))
 
+    # 团队开会恢复泵（与 recover_wait_timeouts 同槽位）：重启/复工后
+    # 恢复 hold / 补弃权 / 重唤主持 / 幂等重投 RESULT。
+    meeting_stats: dict = {}
+    try:
+        from hiveweave.services.meetings.orchestrator import recover_meetings
+
+        meeting_stats = await recover_meetings(project_id)
+    except Exception as e:
+        log.warning(
+            "activate_meeting_recovery_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+
     return {
         "ok": True,
         "projectId": project_id,
         "is_started": True,
         "resumeBriefings": briefing_stats,
+        "meetingRecovery": meeting_stats,
     }
 
 
@@ -1628,6 +1643,24 @@ async def deactivate_project(project_id: str) -> dict:
     await meta_db.execute(
         "UPDATE projects SET is_started = 0 WHERE id = ?", [project_id]
     )
+
+    # 团队开会下班处置：abort 进行中的会议（不留下 assembling 僵尸行），
+    # 解 hold + [MEETING ABORTED]（off_duty），不投 RESULT。
+    meeting_aborted = 0
+    try:
+        from hiveweave.services.meetings.orchestrator import (
+            abort_active_meetings_for_project,
+        )
+
+        meeting_aborted = await abort_active_meetings_for_project(
+            project_id, "off_duty"
+        )
+    except Exception as e:
+        log.warning(
+            "deactivate_meeting_abort_failed",
+            project_id=project_id,
+            error=str(e),
+        )
 
     parked = 0
     try:
@@ -1661,6 +1694,7 @@ async def deactivate_project(project_id: str) -> dict:
         "is_started": False,
         "parkedInbox": parked,
         "stoppedAgents": stop_stats,
+        "meetingsAborted": meeting_aborted,
     }
 
 

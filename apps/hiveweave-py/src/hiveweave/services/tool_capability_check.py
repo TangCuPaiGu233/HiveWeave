@@ -34,27 +34,8 @@ class ToolCapabilityMappingError(AssertionError):
 # 有意不设能力硬门的注册工具（新增请附一行理由）。断言只对「既不在
 # TOOL_CAPABILITY、也不在此集合」的工具报错。
 EXEMPT_TOOLS = frozenset({
-    # ── 只读检查 / 状态观测 ──
-    "grep",
-    "list_files",
-    "read_file",
-    "search_files",
-    "read_charter",
-    "read_goals",
-    "read_memory",
-    "read_roster",
-    "read_skill",
-    "read_work_logs",
-    "list_available_skills",
-    "list_alarms",
-    "list_subordinates",
-    "check_agent_status",
-    "check_agent_progress",
-    "get_platform_state",
-    "get_tasks",
-    "view_org_chart",
-    "git_worktree_list",  # 只读 worktree 元数据
-    "git_worktree_status",
+    # ── 只读检查 / 状态观测：20 条已收编 TOOL_CAPABILITY→SOURCE_READ
+    #    （45 轮批次6；五族均有 SOURCE_READ，零行为变化）──
     # ── 通信 / 协作（收件方由 org 关系约束，非能力门） ──
     "send_message",
     "message_superior",
@@ -85,11 +66,11 @@ EXEMPT_TOOLS = frozenset({
     "write_memory",
     "write_work_log",
     # ── 杂项只读/工具性 ──
+    # （git_worktree_checkpoint 已收编 → SOURCE_WRITE，45 轮批次6）
     "calculate",
     "todowrite",
     "webfetch",
     "websearch",
-    "git_worktree_checkpoint",  # 只往自己的 worktree 打 checkpoint，无 MAIN 写
     # ── 显式回归锁：必须留在映射外（HR 无 BROWSE 也要能看图）──
     # tests/test_look_at_image.py::test_look_at_image_not_bound_to_browse_capability
     "look_at_image",
@@ -99,6 +80,14 @@ EXEMPT_TOOLS = frozenset({
     # 沙箱禁直写平台仓库，deliver_patch 是唯一合法出口；落点限
     # .hiveweave/patch-deliveries/（下游人工评审后应用），非任意执行通道。
     "deliver_patch",
+    # ── 团队开会（docs/spec/team-meeting.md）──
+    # speak_in_meeting / continue_meeting_round / conclude_topic 只在
+    # MeetingTurnRunner 执行期白名单内可达（runner 回调本地拦截，不落
+    # executor）；普通路径由 policy.tool_hard_deny 的 MEETING_RUNNER_TOOLS
+    # 一律硬拒（policy.py），无角色能越权 —— 能力门即「全员显式硬拒」。
+    "speak_in_meeting",
+    "continue_meeting_round",
+    "conclude_topic",
     # 注：python_script / run_smoke 曾在此豁免，42 轮审计 P1 指出二者是
     # 执行通道（python_script native 路径不经 command_guard，可一行绕过
     # icacls/takeown 等 bash 硬门）→ 已改映射 TOOL_CAPABILITY：

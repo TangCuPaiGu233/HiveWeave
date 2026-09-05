@@ -160,15 +160,18 @@ class SpawnSubagentParams(BaseModel):
 @tool(
     "spawn_subagent",
     "Delegate a self-contained task to a subagent in its own context "
-    "(it does not see this conversation). Returns immediately with waiting_on — "
-    "then commit_turn(phase=waiting) using that list. Woken with "
+    "(it does not see this conversation). Each spawn returns its own "
+    "waiting_on entry — batch ALL pending entries (spawns + background bash) "
+    "into ONE commit_turn(phase=waiting, waiting_on=[...]). Woken with "
     "[SUBAGENT DONE] / [SUBAGENT FAILED]. The subagent works in YOUR worktree "
     "with YOUR permissions, returns its result not intermediate steps, and "
     "must commit_turn before finishing. Give a complete standalone prompt. "
     "subagent_type is REQUIRED: 'readonly' (read-only scout), 'audit' (run "
     "tests/browse + submit — no attestation), or 'write' (edit code + "
-    "git_worktree; requires parent SOURCE_WRITE). Concurrent writes to the "
-    "same files will collide. Do not nest this work inside the current LLM turn.",
+    "git_worktree; requires parent SOURCE_WRITE). Multiple write subagents "
+    "share YOUR worktree: concurrent writes to the same files collide — "
+    "partition files or run them sequentially. Do not nest this work inside "
+    "the current LLM turn.",
     requires_workspace=False,
     security_level="standard",
 )

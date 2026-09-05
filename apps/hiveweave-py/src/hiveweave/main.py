@@ -853,6 +853,17 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 log.warning("wait_recovery_failed", project_id=p["id"],
                             error=str(e))
+            # 团队开会恢复泵（与 recover_wait_timeouts 同槽位）：重启后
+            # 恢复 hold / 补弃权 / 重唤主持 / 幂等重投 RESULT。
+            try:
+                from hiveweave.services.meetings.orchestrator import (
+                    recover_meetings,
+                )
+
+                await recover_meetings(p["id"])
+            except Exception as e:
+                log.warning("meeting_recovery_failed", project_id=p["id"],
+                            error=str(e))
         log.info("wait_timeouts_recovered", projects=len(projects))
     except Exception as e:
         log.warning("wait_recovery_init_failed", error=str(e))

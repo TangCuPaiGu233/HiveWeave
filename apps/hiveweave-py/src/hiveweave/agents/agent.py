@@ -42,6 +42,8 @@ from hiveweave.llm.retry import (
 from hiveweave.llm.streamer import Streamer
 from hiveweave.prompts.context import build_context_prompt
 from hiveweave.prompts.identity import build_identity_prompt, resolve_prompt_role_type
+# 会务 hold 卡口（规格 §hold：Agent.chat / _drain_message_queue 两处）
+from hiveweave.services.meetings import hold as meeting_hold
 from hiveweave.services.approval import approval_service
 from hiveweave.services.charter import charter_service
 from hiveweave.services.chat_message import ChatMessageService
@@ -561,6 +563,23 @@ class Agent:
             # cancel() 会杀掉 inbox watcher — agent 再次被激活时复活它，
             # 否则 agent 此后读不到同伴消息（"失联"）直到进程重启。
             self._ensure_watcher_alive()
+
+            # ── 会务 hold 卡口（docs/spec/team-meeting.md §hold 三处卡口）──
+            # held 且非会务 → 重新入队，不启动 LLM。队列原样保留，散会
+            # 回岗时随普通 trigger 一起消化。
+            if meeting_hold.is_held(self.id) and not (opts or {}).get(
+                "meeting_turn"
+            ):
+                self._message_queue.append(
+                    (message, opts, int(time.time() * 1000))
+                )
+                log.info(
+                    "chat_held_requeued",
+                    agent_id=self.id,
+                    queue_len=len(self._message_queue),
+                    preview=message[:80],
+                )
+                return {"ok": True, "queued": True, "held": True}
 
             # 检查 busy → queue the message instead of dropping it
             if self.status == AgentState.PROCESSING:
@@ -3030,6 +3049,15 @@ class Agent:
 
         Trigger/watcher wakes coalesce into one turn; user messages stay FIFO.
         """
+        # ── 会务 hold 卡口：held → 完全 no-op（不清队列，不启动 LLM）。
+        # 会务回合不进 _message_queue；散会回岗后一次性 drain。
+        if meeting_hold.is_held(self.id):
+            log.info(
+                "drain_held_noop",
+                agent_id=self.id,
+                queue_len=len(self._message_queue),
+            )
+            return
         if not self._message_queue:
             return
         # Merge window: let near-simultaneous triggers pile up

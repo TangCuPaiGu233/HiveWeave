@@ -274,6 +274,15 @@ async def send_chat(body: ChatSendBody) -> dict:
         return {"ok": True, "userMessageId": user_msg["id"], "reset": True}
     if result.get("error") == "paused":
         raise HTTPException(status_code=409, detail="System is paused")
+    if result.get("held"):
+        # 会务 hold（docs/spec/team-meeting.md §前端）：chat() 卡口把消息
+        # 原样入队保留（散会回岗随普通 trigger 消化），REST 返回结构化
+        # error，前端/调用方据此知道本轮未启动 LLM。
+        return {
+            "error": "meeting_hold",
+            "queued": True,
+            "userMessageId": user_msg["id"],
+        }
     if result.get("error") == "project_not_started":
         asst = await send_off_duty_auto_reply(agent_id)
         return {

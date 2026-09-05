@@ -406,6 +406,8 @@ _EXPORT_TABLES = [
     "agents", "tasks", "task_events", "agent_runs", "run_steps",
     "tool_attestations", "chat_messages", "work_logs", "handoffs",
     "inbox", "memories", "verification_cases",
+    # 团队开会（平台侧观察记录，非 agent 记忆）
+    "meetings", "meeting_utterances",
 ]
 
 # run_steps 无 agent_id 列，需 join agent_runs 补上（LEFT：孤儿行保留，agent_id 为 NULL）

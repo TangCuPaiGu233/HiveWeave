@@ -25,6 +25,8 @@ import structlog
 
 from hiveweave.services.handoff import HandoffService
 from hiveweave.services.inbox import InboxService
+# 会务 hold 卡口（规格 §hold：_do_trigger 写 digest 前守卫）
+from hiveweave.services.meetings import hold as meeting_hold
 from hiveweave.services.org import OrgService
 
 if TYPE_CHECKING:
@@ -517,6 +519,14 @@ async def _do_trigger(agent_id: str, trigger_type: str, *,
         status = agent_record.get("status")
         if status in ("archived", "dismissed"):
             log.info("trigger_archived_skip", agent_id=agent_id, status=status)
+            return
+
+        # ── 会务 hold 卡口（docs/spec/team-meeting.md §hold 三处卡口）──
+        # 写 digest 之前若 held 则 return：会务外的 trigger 不得把正文
+        # 写入 chat_messages，也不得抢跑被 hold 的 agent。散会回岗由
+        # 编排器解 hold 后再走一次普通 trigger。
+        if meeting_hold.is_held(agent_id):
+            log.info("trigger_meeting_held_skip", agent_id=agent_id)
             return
 
         project_id = agent_record["project_id"]

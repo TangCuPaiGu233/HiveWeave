@@ -99,11 +99,13 @@ export {
   getPlatformTokenUsage,
   tokenRequestTypeLabel,
   getAgentsLiveStatus,
+  getActiveMeeting,
 } from "./api/rest";
 
 export type {
   AgentLiveStatus,
   AgentLivePhase,
+  MeetingInfo,
 } from "./api/rest";
 
 export type {

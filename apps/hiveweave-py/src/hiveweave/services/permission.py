@@ -63,6 +63,8 @@ CEO_TOOLS = _BASE_TOOLS | frozenset({
     "git_worktree_merge", "git_worktree_remove",
     # 终验对用户说
     "message_user",
+    # 团队开会（仅 ceo/coordinator 可开；family 硬门见 policy）
+    "start_team_meeting",
 })
 
 COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
@@ -93,6 +95,8 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     "run_full_review",
     "request_code_audit",
     "assert_visual",
+    # 团队开会（仅 ceo/coordinator 可开；family 硬门见 policy）
+    "start_team_meeting",
 })
 
 # Legacy alias — builder coordinator 即原 COORDINATOR_TOOLS 语义的超集。
@@ -106,10 +110,11 @@ HR_TOOLS = _BASE_TOOLS | frozenset({
     "write_file",
 })
 
-# Legacy name kept for imports/tests — executor listing after hard gates.
-# Do NOT include hire/dispatch/bash elevation here for "readonly" meaning;
+# Executor base set（45 轮批次6 由误导性的 READONLY_TOOLS 改名——集合里
+# 全是 bash/write/spawn 级工具，与 readonly 毫无关系）。审计遗留低危销项。
+# Do NOT include hire/dispatch/bash elevation beyond builder semantics;
 # PolicyService still hard-denies based on role family.
-READONLY_TOOLS = _BASE_TOOLS | frozenset({
+EXECUTOR_BASE_TOOLS = _BASE_TOOLS | frozenset({
     "bash", "bash_main", "python_script", "write_file", "browse", "browse_main", "assert_visual", "game_run_case", "game_run_case_main", "edit_file",
     "pwsh", "pwsh_main",
     "job_kill",
@@ -128,7 +133,10 @@ READONLY_TOOLS = _BASE_TOOLS | frozenset({
     "git_worktree_sync",
 })
 
-READWRITE_TOOLS = READONLY_TOOLS | frozenset({
+# Legacy alias（tests/外部 import 仍在用；勿删）
+READONLY_TOOLS = EXECUTOR_BASE_TOOLS
+
+READWRITE_TOOLS = EXECUTOR_BASE_TOOLS | frozenset({
     "run_command",
     "request_code_audit",
 })

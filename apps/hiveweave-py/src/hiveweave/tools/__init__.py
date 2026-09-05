@@ -59,6 +59,7 @@ import hiveweave.tools.job_tools  # noqa: F401 — registers job_kill
 import hiveweave.tools.code_audit  # noqa: F401 — registers request_code_audit
 import hiveweave.tools.python_script  # noqa: F401 — registers python_script (E11)
 import hiveweave.tools.smoke_tools  # noqa: F401 — registers run_smoke (交付级冒烟预跑通道)
+import hiveweave.tools.meeting_tools  # noqa: F401 — registers start_team_meeting/speak_in_meeting/continue/conclude
 from hiveweave.tools.base import _TOOL_REGISTRY, list_tool_names  # noqa: F401
 from hiveweave.tools.result import ToolResult as ToolResultDataclass  # noqa: F401
 from hiveweave.tools.pipeline import ToolContext  # noqa: F401

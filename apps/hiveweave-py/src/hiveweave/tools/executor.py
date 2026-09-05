@@ -652,12 +652,16 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Delegate a self-contained task to a subagent in its own context "
             "(it does not see this conversation). It works in YOUR worktree "
             "with YOUR permissions and returns its result, not intermediate "
-            "steps. This call returns immediately with waiting_on — then "
-            "commit_turn(phase=waiting) using that list; do not poll. Woken "
-            "with [SUBAGENT DONE] / [SUBAGENT FAILED]. Give a complete "
-            "standalone prompt. subagent_type is REQUIRED: readonly | audit "
-            "| write. Concurrent writes to the same files will collide. "
-            "Do not nest this work inside the current LLM turn."
+            "steps. Each spawn returns its own waiting_on entry — batch ALL "
+            "pending entries (spawns + background bash) into ONE "
+            "commit_turn(phase=waiting, waiting_on=[...]); do not poll. "
+            "Dispatch independent children in the same turn rather than "
+            "serializing them. Woken with [SUBAGENT DONE] / [SUBAGENT "
+            "FAILED]. Give a complete standalone prompt. subagent_type is "
+            "REQUIRED: readonly | audit | write. Multiple write subagents "
+            "share YOUR worktree: concurrent writes to the same files "
+            "collide — partition files or run them sequentially. Do not "
+            "nest this work inside the current LLM turn."
         ),
         "type": "object",
         "properties": {
@@ -1290,6 +1294,24 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "Other task ids only (self-id rejected). Unmet → blocked "
                     "(assignee recorded, not woken). VERIFY titles skip "
                     "auto-block. People-waiting is commit_turn, not this list."
+                ),
+            },
+            "acceptanceCriteria": {
+                "type": "array",
+                "items": {"type": "string"},
+                "aliases": ["acceptance_criteria"],
+                "description": (
+                    "Per-item DoD the assignee must cover in evidence; "
+                    "empty = free-text review only."
+                ),
+            },
+            "verifiedFacts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "aliases": ["verified_facts"],
+                "description": (
+                    "已核事实：你亲自核验过的现场事实逐条列出，注入任务卡"
+                    "（执行者免盲探索）。只写亲自确认过的。"
                 ),
             },
         },
@@ -2109,6 +2131,97 @@ TOOL_PARAM_SCHEMAS["game_run_case_main"] = {
         "for milestone VERIFY / MAIN H5 QA. Slice harness stays on "
         "game_run_case."
     ),
+}
+
+# ── 团队开会（docs/spec/team-meeting.md）─────────────────────
+
+TOOL_PARAM_SCHEMAS["start_team_meeting"] = {
+    "description": (
+        "Open a structured team meeting you chair (CEO/coordinator only). "
+        "Attendees then speak in PARALLEL BLIND review — nobody sees "
+        "colleagues' raw speeches, only your written direction between "
+        "rounds. Topics are discussed one by one, max 3 rounds each, round "
+        "3 must conclude. Returns immediately with status=assembling; the "
+        "platform assembles attendees (busy ones join when idle, nothing is "
+        "cancelled) and runs the rounds. Every attendee including you gets "
+        "[MEETING RESULT] when all topics conclude. One active meeting per "
+        "project."
+    ),
+    "properties": {
+        "title": {
+            "type": "string",
+            "description": "One-line meeting title.",
+        },
+        "topics": {
+            "type": "array",
+            "aliases": ["topic_list", "agenda"],
+            "description": (
+                "1..8 concrete questions to decide, in discussion order."
+            ),
+        },
+        "participantIds": {
+            "type": "array",
+            "aliases": ["participant_ids", "participants", "attendees"],
+            "description": (
+                "Agent ids to invite (cross-span ok; archived/foreign-"
+                "project rejected). You attend as chair automatically."
+            ),
+        },
+    },
+    "required": ["title", "topics", "participantIds"],
+}
+
+TOOL_PARAM_SCHEMAS["speak_in_meeting"] = {
+    "description": (
+        "Meeting turns only: submit your speech for the current topic from "
+        "your own role's angle. One speech per round; empty content is "
+        "rejected and recorded as abstain. You cannot see other attendees' "
+        "speeches. After recording, the turn ends."
+    ),
+    "properties": {
+        "content": {
+            "type": "string",
+            "description": "Your statement for the current topic.",
+        },
+    },
+    "required": ["content"],
+}
+
+TOOL_PARAM_SCHEMAS["continue_meeting_round"] = {
+    "description": (
+        "Chair-only, facilitation turns only: write the direction for the "
+        "next round and reopen discussion (max 3 rounds; unavailable at "
+        "round 3 — conclude_topic instead). Attendees next see only the "
+        "topic, this direction, and already-concluded results."
+    ),
+    "properties": {
+        "direction": {
+            "type": "string",
+            "aliases": ["next_round_direction", "guidance"],
+            "description": (
+                "What is unresolved, which positions conflict, what to "
+                "address next round."
+            ),
+        },
+    },
+    "required": ["direction"],
+}
+
+TOOL_PARAM_SCHEMAS["conclude_topic"] = {
+    "description": (
+        "Chair-only, facilitation turns only: close the current topic with "
+        "your conclusion (any round; round 3 MUST). Concluding the last "
+        "topic ends the meeting and delivers [MEETING RESULT] to every "
+        "attendee. The platform never writes conclusions for you."
+    ),
+    "properties": {
+        "result": {
+            "type": "string",
+            "aliases": ["conclusion", "decision"],
+            "description": "The decision everyone will receive.",
+        },
+    },
+    "required": ["result"],
 }
 
 def _resolve_alias_for_tool(arg_name: str, props: dict) -> str | None:

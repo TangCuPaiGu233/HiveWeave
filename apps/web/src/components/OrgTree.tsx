@@ -3,7 +3,7 @@ import {
 } from "react";
 import ApprovalDialog from "./ApprovalDialog";
 import { getOrgTree, getCommunications, getProjectPendingApprovals, getUserPings, getProjectAlarms, getAgentsLiveStatus, type AgentLiveStatus } from "../api";
-import { useAppStore, type AgentAlarmInfo } from "../store";
+import { useAppStore, MEETING_ACTIVE_STATUSES, type AgentAlarmInfo } from "../store";
 import { getPositionLabel } from "../utils/role-styles";
 import { realMsToGameSeconds, gameSecondsToRealMs, decomposeGameSeconds } from "../utils/game-time";
 
@@ -611,6 +611,14 @@ function OrgTree() {
   const processingAgents = useAppStore((s) => s.processingAgents);
   const agentAlarms = useAppStore((s) => s.agentAlarms);
   const agentHealth = useAppStore((s) => s.agentHealth);
+  // 团队开会状态（meeting_updated 事件 / REST 水合 → store）
+  const activeMeeting = useAppStore((s) => s.activeMeeting);
+  const meetingBadge =
+    activeMeeting &&
+    MEETING_ACTIVE_STATUSES.has(activeMeeting.status) &&
+    (!activeMeeting.projectId || activeMeeting.projectId === selectedProjectId)
+      ? activeMeeting
+      : null;
 
   // State
   const [roots, setRoots] = useState<OrgNodeData[]>([]);
@@ -1109,6 +1117,28 @@ function OrgTree() {
             onFit={fitToView}
           />
         </>
+      )}
+
+      {/* 团队开会徽标（docs/spec/team-meeting.md §前端：OrgTree 集合中 vs 开会中）。
+          人不能从 UI 开会 —— 这里只是状态入口，不提供发起/干预按钮。 */}
+      {meetingBadge && (
+        <div
+          data-testid="org-meeting-badge"
+          className="absolute top-3 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 rounded-full bg-amber-100 border border-amber-300 text-xs text-amber-800 shadow-gm-sm flex items-center gap-2 pointer-events-none"
+        >
+          <span className="w-1.5 h-1.5 rounded-full bg-amber-500 hw-status-live shrink-0" />
+          <span className="font-semibold shrink-0">
+            {meetingBadge.status === "assembling" ? "会议集合中" : "开会中"}
+          </span>
+          {meetingBadge.title ? (
+            <span className="max-w-[16rem] truncate">{meetingBadge.title}</span>
+          ) : null}
+          {meetingBadge.status !== "assembling" && (
+            <span className="shrink-0 tabular-nums">
+              议题 {(meetingBadge.topicIndex || 0) + 1} · 第 {meetingBadge.roundIndex || 1}/3 轮
+            </span>
+          )}
+        </div>
       )}
 
       {approvalAgentId && (

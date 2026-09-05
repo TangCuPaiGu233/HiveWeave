@@ -495,10 +495,23 @@ async def dispatch_task_tool(
                 "arrive via merge)."
             )
         parent = result.get("parent_task_id") or ""
+        # 45 轮批次6：批量派单叙事（旧文案单数 + 与 waiting_on 列表形
+        # 不一致，模型被引导成一次只派一个子任务——45 轮潮汐反证并行
+        # 派 4 单无冲突，引导是唯一枷锁）。
         output += (
-            " Wait on this child with commit_turn(waiting, kind=task, "
-            "ref=the task_id above); do not ask_agent the assignee to submit."
+            " If more independent children remain, keep dispatching them"
+            " all this turn; then ONE commit_turn(waiting, waiting_on=["
+            "{kind:task, ref:<each task_id>}, ...]) covers every dispatch."
+            " Do not ask_agent the assignee to submit."
         )
+        if not params.verified_facts:
+            # 45 轮批次6：verifiedFacts 主动提示（42 轮 0/20 + 45 轮 0/18
+            # 采用——schema 缺失与引导弱双重根因，本批双双补齐）。
+            output += (
+                " verifiedFacts is still empty — pin facts YOU verified"
+                " firsthand (MAIN HEAD, test output, file states) so the"
+                " assignee skips blind re-exploration."
+            )
         if parent:
             output += f" parent_task_id={parent}."
         if result.get("blocked"):

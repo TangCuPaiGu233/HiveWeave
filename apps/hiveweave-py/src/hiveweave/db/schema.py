@@ -626,6 +626,41 @@ PROJECT_DB_TABLES = [
     # 量程位由 llm/util.normalize_usage 的 cache_creation_reported 单一判据
     # 取反落库，新旧库都由 ALTER 补列（与 cold_start 同模式）。
     """ALTER TABLE llm_usage ADD COLUMN creation_unreported INTEGER DEFAULT 0""",
+    # ── 团队开会（docs/spec/team-meeting.md）─────────────────
+    # 平台侧会务记录（人观察 / debug / export），不是 agent 记忆。
+    # 每次状态迁移写行；同项目只允许一场进行中（partials unique index，
+    # DB 唯一约束而非 check-then-insert）。
+    """
+    CREATE TABLE IF NOT EXISTS meetings (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        chair_id TEXT NOT NULL,
+        title TEXT,
+        topics_json TEXT NOT NULL DEFAULT '[]',
+        participant_ids_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'assembling',
+        topic_index INTEGER NOT NULL DEFAULT 0,
+        round_index INTEGER NOT NULL DEFAULT 0,
+        topic_results_json TEXT NOT NULL DEFAULT '[]',
+        delivery_state TEXT NOT NULL DEFAULT 'none',
+        hold_started_at INTEGER,
+        created_at INTEGER,
+        concluded_at INTEGER
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS meeting_utterances (
+        id TEXT PRIMARY KEY,
+        meeting_id TEXT NOT NULL,
+        project_id TEXT NOT NULL DEFAULT '',
+        topic_index INTEGER NOT NULL DEFAULT 0,
+        round_index INTEGER NOT NULL DEFAULT 0,
+        agent_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT,
+        created_at INTEGER
+    )
+    """,
 ]
 
 # ── Per-project DB 建表自检（迁移顺序缺陷防护）────────────────
@@ -699,4 +734,10 @@ PROJECT_DB_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_llm_usage_project ON llm_usage(project_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_llm_usage_run ON llm_usage(run_id)",
     "CREATE INDEX IF NOT EXISTS idx_llm_usage_task ON llm_usage(task_id)",
+    # ── 团队开会索引 ─────────────────────────────────────────
+    # 同项目进行中一场：partial UNIQUE 是 DB 级唯一约束（非 check-then-insert）
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_meetings_active_per_project ON meetings(project_id) WHERE status IN ('assembling','collecting','facilitating')",
+    "CREATE INDEX IF NOT EXISTS idx_meetings_project_created ON meetings(project_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_meeting_utterances_meeting ON meeting_utterances(meeting_id, topic_index, round_index)",
+    "CREATE INDEX IF NOT EXISTS idx_meeting_utterances_agent ON meeting_utterances(meeting_id, agent_id)",
 ]

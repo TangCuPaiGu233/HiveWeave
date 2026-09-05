@@ -162,6 +162,31 @@ export async function getProjectGoals(projectId: string) {
   return fetchJSON(`${BASE}/projects/${projectId}/goals`);
 }
 
+// ── 团队开会（docs/spec/team-meeting.md §前端）──────────────
+
+export interface MeetingInfo {
+  id: string;
+  projectId: string;
+  chairId: string;
+  title: string;
+  topics: string[];
+  participants: string[];
+  status: "assembling" | "collecting" | "facilitating" | "concluded" | "aborted";
+  topicIndex: number;
+  roundIndex: number;
+  topicResults: Array<{ title: string; result: string }>;
+  deliveryState: string;
+  holdStartedAt: number | null;
+  createdAt: number | null;
+  concludedAt: number | null;
+}
+
+export async function getActiveMeeting(
+  projectId: string
+): Promise<{ meeting: MeetingInfo | null; heldAgentIds: string[] }> {
+  return fetchJSON(`${BASE}/projects/${projectId}/meetings/active`);
+}
+
 export async function updateProjectGoals(projectId: string, goals: any) {
   return fetchJSON(`${BASE}/projects/${projectId}/goals`, {
     method: "PUT",

@@ -50,6 +50,31 @@ def looks_unbounded_external(kind: str, ref: str) -> bool:
     return r.startswith(("bg-bash-", "bg-sub-"))
 
 
+async def _meeting_frozen_wait_ids(project_id: str, conn: Any) -> set[str]:
+    """团队开会 hold 冻结：held agents 的全部 active wait ids。
+
+    单一卡点：meetings.hold.held_agent_ids（规格 §hold「hold 期间不得
+    clear_expired」）。fail-open — 导入/查询异常按无冻结处理。
+    """
+    try:
+        from hiveweave.services.meetings.hold import held_agent_ids
+
+        held = held_agent_ids(project_id)
+        if not held:
+            return set()
+        placeholders = ",".join("?" for _ in held)
+        cur = await conn.execute(
+            "SELECT id FROM agent_waits "
+            f"WHERE cleared_at IS NULL AND agent_id IN ({placeholders})",
+            sorted(held),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return {str(r["id"]) for r in rows or []}
+    except Exception:
+        return set()
+
+
 def _should_hold_live_offturn_wait(row: dict) -> bool:
     """True when this wait still names a live bg job."""
     kind = str(row.get("kind") or "").lower()
@@ -788,10 +813,20 @@ class WaitContractService:
         )
         rows = await cur.fetchall()
         await cur.close()
+        # 会议 hold 冻结：held agents 的 NULL-expiry waits 不在 hold 期间
+        # 重新武装 TTL（clear 侧同样冻结；解 hold 时统一补时）。
+        try:
+            from hiveweave.services.meetings.hold import held_agent_ids as _held
+
+            frozen_agents = _held(project_id)
+        except Exception:
+            frozen_agents = set()
         now = int(time.time() * 1000)
         statements: list[tuple[str, list[Any] | None]] = []
         n = 0
         for r in rows:
+            if frozen_agents and str(r["agent_id"] or "") in frozen_agents:
+                continue
             kind = str(r["kind"] or "external")
             ref = str(r["ref"] or "")
             aid = str(r["agent_id"] or "")
@@ -819,12 +854,18 @@ class WaitContractService:
     async def clear_expired(
         self, project_id: str, agent_id: str | None = None
     ) -> list[dict]:
-        """Clear expired waits; return the wait dicts that were cleared."""
+        """Clear expired waits; return the wait dicts that were cleared.
+
+        团队开会 hold（docs/spec/team-meeting.md）：held agents 的 wait
+        冻结——clear 跳过（解 hold 时由 meetings.hold 统一补时）。
+        fail-open：过滤层异常不改变既有行为。
+        """
         await _ensure_schema(project_id)
         conn = await _conn(project_id)
         if conn is None:
             return []
         now = int(time.time() * 1000)
+        frozen_ids = await _meeting_frozen_wait_ids(project_id, conn)
         if agent_id:
             cur = await conn.execute(
                 "SELECT * FROM agent_waits "
@@ -870,6 +911,9 @@ class WaitContractService:
                 continue
             seen.add(cid)
             if _should_hold_live_offturn_wait(c):
+                continue
+            # 会议 hold 冻结：held agent 的 waits 不 clear（开会不计入等待）
+            if cid in frozen_ids:
                 continue
             cleared.append(c)
         if not cleared:

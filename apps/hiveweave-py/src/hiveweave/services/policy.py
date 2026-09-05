@@ -163,6 +163,31 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     # 45 轮 #9：MCP 目录只读——仅 HR（能力矩阵里 STAFFING 只有 hr 族有；
     # coordinator 族无）。调用方是 HR 招聘提示（coordinator.py:384/409）。
     "list_available_mcp": frozenset({Capability.STAFFING}),
+    # ── 45 轮批次6 收编：只读观测类（五族均有 SOURCE_READ，映射零行为
+    # 变化；原 EXEMPT 豁免收回，启动断言从此对它们有真实覆盖）──
+    "grep": frozenset({Capability.SOURCE_READ}),
+    "list_files": frozenset({Capability.SOURCE_READ}),
+    "read_file": frozenset({Capability.SOURCE_READ}),
+    "search_files": frozenset({Capability.SOURCE_READ}),
+    "read_charter": frozenset({Capability.SOURCE_READ}),
+    "read_goals": frozenset({Capability.SOURCE_READ}),
+    "read_memory": frozenset({Capability.SOURCE_READ}),
+    "read_roster": frozenset({Capability.SOURCE_READ}),
+    "read_skill": frozenset({Capability.SOURCE_READ}),
+    "read_work_logs": frozenset({Capability.SOURCE_READ}),
+    "list_available_skills": frozenset({Capability.SOURCE_READ}),
+    "list_alarms": frozenset({Capability.SOURCE_READ}),
+    "list_subordinates": frozenset({Capability.SOURCE_READ}),
+    "check_agent_status": frozenset({Capability.SOURCE_READ}),
+    "check_agent_progress": frozenset({Capability.SOURCE_READ}),
+    "get_platform_state": frozenset({Capability.SOURCE_READ}),
+    "get_tasks": frozenset({Capability.SOURCE_READ}),
+    "view_org_chart": frozenset({Capability.SOURCE_READ}),
+    "git_worktree_list": frozenset({Capability.SOURCE_READ}),
+    "git_worktree_status": frozenset({Capability.SOURCE_READ}),
+    # checkpoint 只写自己的 worktree——executor/qa/coordinator 均有
+    # SOURCE_WRITE；CEO/HR 本就不在该工具的可见集（allowlist 外）。
+    "git_worktree_checkpoint": frozenset({Capability.SOURCE_WRITE}),
     # DOC_WRITE agents (CEO) may edit docs; SOURCE_WRITE covers all paths
     "edit_file": frozenset({Capability.SOURCE_WRITE, Capability.DOC_WRITE}),
     "apply_patch": frozenset({Capability.SOURCE_WRITE}),
@@ -177,6 +202,9 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "run_full_review": frozenset({Capability.SOURCE_READ}),
     # 出口合同前置审计 — 只对可写码角色开放（executor/qa/builder coordinator）
     "request_code_audit": frozenset({Capability.SOURCE_WRITE}),
+    # start_team_meeting：MANAGE_ORG 映射 + 家族特判（HR 有 MANAGE_ORG
+    # 但不开会——见下方 tool_hard_deny）。
+    "start_team_meeting": frozenset({Capability.MANAGE_ORG}),
     # write_file: capability depends on path scope (checked separately)
 }
 
@@ -345,6 +373,20 @@ _VISUAL_STAMP_TOOLS = frozenset({
     "game_run_case_main",
 })
 
+# ── 团队开会（docs/spec/team-meeting.md §权限与工具）──────────
+# start_team_meeting：仅 ceo / coordinator。MANAGE_ORG 不够（HR 也有），
+# 下方 tool_hard_deny 再加家族特判（同 hire_agent 的 HR-only 形状）。
+# speak/continue/conclude 是 MeetingTurnRunner 执行期白名单工具：
+# 不进任何角色 allowlist，普通路径一律硬拒（runner 回调本地拦截，不落
+# executor —— 此 deny 是纵深防御 + 启动断言的「显式决策」落点）。
+MEETING_RUNNER_TOOLS = frozenset({
+    "speak_in_meeting",
+    "continue_meeting_round",
+    "conclude_topic",
+})
+
+_MEETING_FAMILIES = frozenset({"ceo", "coordinator"})
+
 
 def tool_hard_deny(agent: dict[str, Any], tool_name: str) -> str | None:
     """Return deny reason if tool is blocked by hard capability, else None."""
@@ -365,6 +407,27 @@ def tool_hard_deny(agent: dict[str, Any], tool_name: str) -> str | None:
         pass  # 过滤层故障不改变能力判定结果（fail-open 到能力门）
     caps = capabilities_for(agent)
     required = TOOL_CAPABILITY.get(tool_name)
+    # Meeting runner tools: whitelist-only inside MeetingTurnRunner; the
+    # normal executor path can never reach them (runner intercepts locally).
+    # 必须放在未映射早退之前 —— 它们不在 TOOL_CAPABILITY（EXEMPT 是显式
+    # 决策：能力门即「全员显式硬拒」，见 tool_capability_check）。
+    if tool_name in MEETING_RUNNER_TOOLS:
+        return (
+            f"Hard capability deny: '{tool_name}' is a meeting-internal "
+            "tool (MeetingTurnRunner whitelist only) — normal turns cannot "
+            "call it"
+        )
+    # start_team_meeting: MANAGE_ORG passes for HR too — meetings are
+    # chaired by CEO / mid-level coordinators only (spec §权限与工具).
+    # 放在能力不匹配文案之前：拒绝提示要写明「谁能开」（规格验收 A）。
+    if tool_name == "start_team_meeting" and (
+        infer_role_family(agent) not in _MEETING_FAMILIES
+    ):
+        return (
+            f"Hard capability deny: 'start_team_meeting' may only be called "
+            f"by ceo or coordinator; role_family="
+            f"{infer_role_family(agent)} cannot open team meetings"
+        )
     if required is None:
         # write_file 的能力判定走 hard_check → write_path_allowed 的路径
         # scope（TOOL_CAPABILITY 特意不映射它）；未映射工具已由启动断言

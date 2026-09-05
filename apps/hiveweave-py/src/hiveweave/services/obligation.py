@@ -243,11 +243,23 @@ class ObligationLedger:
         return ob_id
 
     async def fulfill(
-        self, project_id: str, task_id: str, obligation_type: str
+        self,
+        project_id: str,
+        task_id: str,
+        obligation_type: str,
+        *,
+        merge_commit: str | None = None,
     ) -> int:
         """Mark all pending obligations of this type+task as fulfilled.
 
         Returns count of obligations fulfilled.
+
+        merge_commit（duty 增强第二部分）：merge 义务 fulfill 时传入本次
+        merge 的 MAIN HEAD（git_worktree_merge 成功结果里的 ``hash``——
+        平台唯一在握的 commit 来源），透传给依赖解封路径，让 [DEPENDENCY
+        MET] 文案带上「基于新 HEAD 复核」。缺省 None 时回退扫描义务
+        context_json 的 commit 字段（2026-09-05 取证：现行 merge 义务写入
+        方都不落 commit，此扫描为前向兼容），仍取不到 → None → 现状文案。
         """
         raw_ref = (task_id or "").strip()
         task_id = await _normalize_task_id(project_id, task_id) or raw_ref
@@ -259,7 +271,7 @@ class ObligationLedger:
         placeholders = ",".join("?" * len(id_candidates))
         rows = await _query(
             project_id,
-            f"SELECT id FROM obligations WHERE task_id IN ({placeholders}) "
+            f"SELECT id, context_json FROM obligations WHERE task_id IN ({placeholders}) "
             "AND obligation_type = ? AND status = 'pending'",
             [*id_candidates, obligation_type],
         )
@@ -291,9 +303,43 @@ class ObligationLedger:
         # TEST16 D1: immediately wake blocked tasks that depend on this task.
         # Don't wait for the 2-min reconcile tick — merge landed, QA can go.
         if obligation_type == "merge" and task_id:
-            await self._wake_dependent_tasks(project_id, task_id)
+            if not merge_commit:
+                merge_commit = self._merge_commit_from_contexts(rows)
+            await self._wake_dependent_tasks(
+                project_id, task_id, merge_commit=merge_commit
+            )
 
         return len(ids)
+
+    @staticmethod
+    def _merge_commit_from_contexts(rows: list) -> str | None:
+        """Scan merge-obligation contexts for a commit field (fail-open → None).
+
+        2026-09-05 取证：现行 merge 义务 context 只写 reason/source/branch/
+        short_id/detail（misc_tools.py / close.py / reconcile.py / review.py），
+        没有 commit —— 本扫描是前向兼容；真 commit 由 fulfill 调用方
+        （git_worktree_merge 工具路径）以 merge_commit= 显式传入。
+
+        行型兼容：obligation._query 返回 dict，但防御 aiosqlite.Row 直传
+        （索引式取值优先，KeyError/TypeError 兜底 .get），杜绝行型漂移
+        让扫描静默失效（审计 P1-A）。
+        """
+        for r in rows:
+            try:
+                raw = r["context_json"]
+            except (KeyError, IndexError, TypeError):
+                raw = r.get("context_json") if isinstance(r, dict) else None
+            try:
+                ctx = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(ctx, dict):
+                continue
+            for key in ("merge_commit", "commit", "commit_sha", "head"):
+                val = str(ctx.get(key) or "").strip()
+                if val:
+                    return val
+        return None
 
     async def fulfill_by_owner(
         self, project_id: str, owner_agent_id: str, obligation_type: str
@@ -546,18 +592,26 @@ class ObligationLedger:
     # ── Internal helpers ─────────────────────────────────────
 
     async def _wake_dependent_tasks(
-        self, project_id: str, fulfilled_task_id: str
+        self,
+        project_id: str,
+        fulfilled_task_id: str,
+        merge_commit: str | None = None,
     ) -> None:
         """TEST16 D1: wake blocked tasks that depend on a fulfilled merge.
 
         Finds tasks in 'blocked' state with fulfilled_task_id in their
         depends_on list, unblocks them, and triggers their assignee.
+
+        duty 增强第二部分：唤醒时补发 [DEPENDENCY MET]（此前此路径只
+        trigger 不落 inbox，QA 被唤醒却不知道 HEAD 已变）——merge_commit
+        非空时文案带 MAIN HEAD 复核语义；并给 creator 发 wake=False FYI
+        （同 commit 幂等）。
         """
         try:
             rows = await _query(
                 project_id,
-                "SELECT id, assignee_id, depends_on FROM tasks "
-                "WHERE status = 'blocked' AND is_archived = 0",
+                "SELECT id, assignee_id, creator_id, title, depends_on "
+                "FROM tasks WHERE status = 'blocked' AND is_archived = 0",
             )
             if not rows:
                 return
@@ -608,10 +662,50 @@ class ObligationLedger:
                 if assignee:
                     try:
                         from hiveweave.agents.trigger import trigger_subordinate
+                        from hiveweave.services.inbox import InboxService
+                        from hiveweave.services.tasks.lifecycle import (
+                            _dependency_met_message,
+                        )
 
+                        await InboxService().send_message(
+                            "system",
+                            assignee,
+                            _dependency_met_message(
+                                fulfilled_task_id,
+                                (row.get("title") or "")[:80],
+                                merge_commit,
+                            ),
+                            message_type="system",
+                            priority="urgent",
+                            task_id=tid,
+                            # 显式同键（审计 D）：与 lifecycle 实现共用，
+                            # 文案漂移不再靠内容哈希巧合防双发
+                            idempotency_key=(
+                                f"dep-met:{tid}:{fulfilled_task_id}:"
+                                f"{str(merge_commit or '')[:12]}"
+                            ),
+                        )
                         await trigger_subordinate(assignee)
                     except Exception:
                         pass
+                # duty 增强第二部分：creator FYI（wake=False，同 commit 幂等）
+                try:
+                    from hiveweave.services.tasks.lifecycle import (
+                        _notify_creator_deps_merged,
+                    )
+
+                    await _notify_creator_deps_merged(
+                        project_id,
+                        {
+                            "id": tid,
+                            "title": row.get("title"),
+                            "creator_id": row.get("creator_id"),
+                            "assignee_id": assignee,
+                        },
+                        merge_commit,
+                    )
+                except Exception:
+                    pass
                 woken += 1
                 log.info(
                     "obligation.merge_dependent_woken",

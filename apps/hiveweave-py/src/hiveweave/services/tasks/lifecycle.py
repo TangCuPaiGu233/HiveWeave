@@ -57,6 +57,130 @@ def blocked_task_has_wake_path(task: dict, now_ms: int | None = None) -> bool:
     return False
 
 
+def _deps_merged_head_note(merge_commit: str | None) -> str:
+    """新 HEAD 合流复核提示（duty 增强第二部分）。
+
+    merge_commit 非空 → 「依赖已合流进 MAIN（HEAD <sha8>），请基于新 HEAD
+    复核/重验后继续」；空 → 空串（调用方回落现状文案，回归不破坏）。
+    """
+    if not merge_commit:
+        return ""
+    return (
+        f"依赖已合流进 MAIN（HEAD {str(merge_commit)[:8]}），"
+        "请基于新 HEAD 复核/重验后继续。"
+    )
+
+
+def _dependency_met_message(
+    completed_task_id: str, title: str, merge_commit: str | None
+) -> str:
+    """[DEPENDENCY MET] assignee 文案：带 merge HEAD → 合流复核语义。
+
+    merge_commit 为 None 时保持 41 轮前的现状文案（review/close 调用点
+    零改动路径的回归保障）。
+    """
+    base = (
+        f"[DEPENDENCY MET] Blocker {completed_task_id[:8]}… is done. "
+        f"Your blocked task '{title}' is unblocked (running). "
+    )
+    return base + (
+        _deps_merged_head_note(merge_commit) or "Continue work or submit_task."
+    )
+
+
+async def _notify_creator_deps_merged(
+    project_id: str, task: dict, merge_commit: str | None
+) -> None:
+    """Creator FYI（wake=False）：被解封任务的创建者知会，非职责信号。
+
+    解封 = 依赖已合流自动继续，创建者无需行动（与 task.blocked relay 的
+    wake=True 职责信号相对）。幂等：显式 idempotency_key 含 commit 前缀，
+    同一 commit 解封只提醒一次（inbox 显式键「只通知一次」契约，不被
+    read-rearm 击穿）。**不带 task_id**：inbox TEST13 P2-2 会把绑定 open
+    任务的 wake=False 消息强制改成 wake=True，破坏 FYI 语义。creator 与
+    assignee 同人时跳过（assignee 已收 [DEPENDENCY MET]）。
+    """
+    creator = str(task.get("creator_id") or "")
+    assignee = str(task.get("assignee_id") or "")
+    tid = str(task.get("id") or "")
+    if not creator or not tid or creator == assignee:
+        return
+    try:
+        from hiveweave.services.inbox import InboxService
+
+        title = (task.get("title") or "")[:80]
+        if merge_commit:
+            fact = "依赖已全部合流"
+            head = f"（HEAD {str(merge_commit)[:8]}）"
+        else:
+            # review/close 路径 deps 只是 approved/closed，未必合流进
+            # MAIN —— 措辞不冒认「合流」（审计 P2-C）
+            fact = "依赖已完成"
+            head = ""
+        await InboxService().send_message(
+            "system",
+            creator,
+            (
+                f"[DEPS MERGED FYI] 你创建的任务 '{title}' 的{fact}"
+                f"{head}并自动解封——无需你行动。"
+            ),
+            message_type="system",
+            priority="normal",
+            wake=False,
+            idempotency_key=(
+                f"deps-merged-fyi:{tid}:{str(merge_commit or '')[:12]}"
+            ),
+        )
+    except Exception as e:
+        log.warning(
+            "creator_deps_merged_fyi_failed",
+            task_id=tid[:12],
+            error=str(e),
+        )
+
+
+async def _recent_merged_commit_for_deps(
+    project_id: str, deps: list
+) -> str | None:
+    """reconcile 兜底路径取 HEAD：deps 的 ``task.merged`` 事件（新→旧）。
+
+    task.merged 由 merge 后钩子（_stamp_merge_fact_on_parent_tasks）落在
+    被合流任务上，payload.merge_commit 即 merge() 返回的 MAIN HEAD。
+    **不能只看最新一条**（审计 P1-B）：payload 写入是 ``str(merge_commit
+    or "")``，最新事件 commit 可为空串——按 created_at 倒序取**第一条
+    非空** commit（较旧事件带真 commit 也要用）。fail-open：查不到 /
+    解析失败 → None（文案保持现状）。
+    """
+    ids = [str(d) for d in deps if d]
+    if not ids:
+        return None
+    placeholders = ",".join("?" * len(ids))
+    try:
+        rows = await _query(
+            project_id,
+            f"SELECT payload FROM task_events "
+            f"WHERE event_type = 'task.merged' "
+            f"AND task_id IN ({placeholders}) "
+            f"ORDER BY created_at DESC LIMIT 50",
+            ids,
+        )
+    except Exception as e:
+        log.debug("recent_merged_commit_lookup_failed", error=str(e))
+        return None
+    for r in rows:
+        try:
+            raw = r["payload"]
+            payload = (
+                json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+            )
+        except (json.JSONDecodeError, TypeError):
+            continue
+        commit = str((payload or {}).get("merge_commit") or "").strip()
+        if commit:
+            return commit
+    return None
+
+
 class LifecycleMixin:
     """start/block/unblock/reconcile + implementer lock / park."""
 
@@ -339,9 +463,17 @@ class LifecycleMixin:
         return None
 
     async def _wake_dependent_tasks(
-        self, project_id: str, completed_task_id: str
+        self,
+        project_id: str,
+        completed_task_id: str,
+        merge_commit: str | None = None,
     ) -> None:
-        """Unblock + notify assignees whose depends_on are all approved/closed."""
+        """Unblock + notify assignees whose depends_on are all approved/closed.
+
+        merge_commit（duty 增强第二部分）：merge 义务 fulfill 路径传入本次
+        merge 的 MAIN HEAD —— [DEPENDENCY MET] 文案升级为「基于新 HEAD 复核/
+        重验」；为 None（review.py / close.py 默认调用）文案保持现状。
+        """
         rows = await _query(
             project_id,
             f"SELECT {self._COLUMNS} FROM tasks "
@@ -409,6 +541,9 @@ class LifecycleMixin:
                 assignee=assignee,
             )
             if not assignee:
+                await _notify_creator_deps_merged(
+                    project_id, task, merge_commit
+                )
                 continue
             try:
                 from hiveweave.services.inbox import InboxService
@@ -418,14 +553,18 @@ class LifecycleMixin:
                 await InboxService().send_message(
                     "system",
                     assignee,
-                    (
-                        f"[DEPENDENCY MET] Blocker {completed_task_id[:8]}… is done. "
-                        f"Your blocked task '{title}' is unblocked (running). "
-                        f"Continue work or submit_task."
+                    _dependency_met_message(
+                        completed_task_id, title, merge_commit
                     ),
                     message_type="system",
                     priority="urgent",
                     task_id=tid,
+                    # 显式同键（审计 D）：与 obligation 实现共用，文案漂移
+                    # 不再靠内容哈希巧合防双发
+                    idempotency_key=(
+                        f"dep-met:{tid}:{completed_task_id}:"
+                        f"{str(merge_commit or '')[:12]}"
+                    ),
                 )
                 await trigger_subordinate(assignee)
             except Exception as e:
@@ -434,6 +573,8 @@ class LifecycleMixin:
                     task_id=tid,
                     error=str(e),
                 )
+            # duty 增强第二部分：creator FYI（wake=False，同 commit 幂等）
+            await _notify_creator_deps_merged(project_id, task, merge_commit)
 
     async def reconcile_blocked_tasks(self, project_id: str) -> int:
         """Sweep blocked tasks: met deps / expired timers → unblock (TEST11 #8).
@@ -475,6 +616,7 @@ class LifecycleMixin:
 
             should_wake = False
             reason_tag = ""
+            deps_met = bool(deps) and all(d in completed for d in deps)
             if wait_kind == "timer" and wake_at is not None:
                 try:
                     if int(wake_at) <= now_ms:
@@ -482,12 +624,19 @@ class LifecycleMixin:
                         reason_tag = "timer_expired"
                 except (TypeError, ValueError):
                     pass
-            if deps and all(d in completed for d in deps):
+            if deps_met:
                 should_wake = True
                 reason_tag = reason_tag or "depends_on_met"
 
             if not should_wake:
                 continue
+            # duty 增强第二部分：deps 满足驱动的解封，尝试从 deps 最近的
+            # task.merged 事件取 MAIN HEAD（取不到 → 文案保持现状）。
+            merge_commit = (
+                await _recent_merged_commit_for_deps(project_id, deps)
+                if deps_met
+                else None
+            )
             assignee = task.get("assignee_id")
             # 审计 O3：无 assignee 的 VERIFY 是 QA 死区（等待 hire），即使
             # wait 已满足也不能 unblock —— 顶成 running 却没有 QA 真正执行，
@@ -511,19 +660,30 @@ class LifecycleMixin:
                 assignee=assignee,
             )
             if not assignee:
+                if deps_met:
+                    await _notify_creator_deps_merged(
+                        project_id, task, merge_commit
+                    )
                 continue
             try:
                 from hiveweave.services.inbox import InboxService
                 from hiveweave.agents.trigger import trigger_subordinate
 
                 title = (task.get("title") or "")[:80]
+                if merge_commit:
+                    body = (
+                        f"[BLOCKED RECONCILED] Task '{title}' ({tid[:8]}) "
+                        "unblocked. " + _deps_merged_head_note(merge_commit)
+                    )
+                else:
+                    body = (
+                        f"[BLOCKED RECONCILED] Task '{title}' ({tid[:8]}) "
+                        f"unblocked ({reason_tag}). Continue or submit_task."
+                    )
                 await InboxService().send_message(
                     "system",
                     assignee,
-                    (
-                        f"[BLOCKED RECONCILED] Task '{title}' ({tid[:8]}) "
-                        f"unblocked ({reason_tag}). Continue or submit_task."
-                    ),
+                    body,
                     message_type="system",
                     priority="urgent",
                     task_id=tid,
@@ -534,6 +694,11 @@ class LifecycleMixin:
                     "reconcile_blocked_notify_failed",
                     task_id=tid,
                     error=str(e),
+                )
+            # duty 增强第二部分：creator FYI（wake=False，同 commit 幂等）
+            if deps_met:
+                await _notify_creator_deps_merged(
+                    project_id, task, merge_commit
                 )
         return woken
 

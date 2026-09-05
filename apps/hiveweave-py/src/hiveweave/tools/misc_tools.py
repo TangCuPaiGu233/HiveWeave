@@ -871,7 +871,8 @@ async def git_worktree_merge_tool(
                     m = re.match(r"^hw/([^/]+)/t-([0-9a-fA-F]{8})$", str(_br))
                     if m:
                         await ObligationLedger().fulfill(
-                            project_id, m.group(2), "merge"
+                            project_id, m.group(2), "merge",
+                            merge_commit=result.get("hash"),
                         )
             except Exception as e:
                 log.warning("merge_obligation_fulfill_failed", error=str(e))
@@ -912,11 +913,13 @@ async def git_worktree_merge_tool(
                 if m and m.group(2).lower() not in seen_branch_tasks:
                     seen_branch_tasks.add(m.group(2).lower())
                     fulfilled += await ObligationLedger().fulfill(
-                        project_id, m.group(2), "merge"
+                        project_id, m.group(2), "merge",
+                        merge_commit=result.get("hash"),
                     )
             if params.task_id:
                 fulfilled += await ObligationLedger().fulfill(
-                    project_id, params.task_id, "merge"
+                    project_id, params.task_id, "merge",
+                    merge_commit=result.get("hash"),
                 )
             # 审计[1]：分支/task 结算后，caller 名下若仍有 pending merge 义务
             # （如历史非规范分支名遗留、或 caller 自身其它任务的义务），

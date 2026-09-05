@@ -1561,7 +1561,14 @@ class Agent:
             )
         except Exception:
             pass
-        messages.append({"role": "user", "content": user_content})
+        user_entry: dict = {"role": "user", "content": user_content}
+        # 用户发图：opts.images（vision.parse_user_images 产出的内部格式）随
+        # 本轮 user 消息进请求 — provider 按 supports_images 渲染多模态 parts
+        # 或剥图留指引。历史里的用户图走 conversation 用户 turn（见 completion）。
+        turn_images = (opts or {}).get("images")
+        if turn_images:
+            user_entry["images"] = turn_images
+        messages.append(user_entry)
 
         # 5b. Ephemeral RESUME CHECKPOINT — once per interrupt, not into history
         hint = self._pending_resume_hint

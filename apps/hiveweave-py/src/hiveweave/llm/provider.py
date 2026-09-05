@@ -185,6 +185,14 @@ _IMAGES_OMITTED_NOTE = (
     "（已自动降级，仅发文字）。截图文件路径仍在相关工具结果文本里。"
 )
 
+# 用户上传图（非工具截图）的未注入说明（审计 P2-3）：用户图无文件路径、
+# agent 无法重截 —— 「截图路径仍在」语义不成立，user 分支按来源分流文案。
+_USER_IMAGES_OMITTED_NOTE = (
+    "[平台提示] 用户消息附带的 {n} 张图片因上下文预算未注入"
+    "（当前对话模型不支持图像输入，已自动降级，仅发文字）；"
+    "如需像素请让用户重发。"
+)
+
 # ── 图像能力负缓存（让模型自己决定）────────────────────────────
 # 不再依赖人工勾选 supports_images：默认按放行，模型/网关真正返回
 # 「图像不支持」类 400 时，由 streamer 标记负缓存并剥图重试一次。
@@ -476,8 +484,9 @@ class OpenAIHandler(FormatHandler):
 
             if role == "user" and not supports_images:
                 # text-only 模型：剥图留文 + 指引（非 user 角色走下方静默剥图）。
+                # 用户上传图无文件路径、无法重截 → 用 user 专属文案（审计 P2-3）。
                 cleaned = {k: v for k, v in msg.items() if k != "images"}
-                note = _IMAGES_OMITTED_NOTE.format(n=len(images))
+                note = _USER_IMAGES_OMITTED_NOTE.format(n=len(images))
                 text = msg.get("content") or ""
                 if isinstance(text, str):
                     cleaned["content"] = (text + "\n\n" + note) if text else note
@@ -757,9 +766,10 @@ class AnthropicHandler(FormatHandler):
         raw_images = msg.get("images") or []
         images = raw_images if supports_images else []
         if raw_images and not supports_images:
+            # 用户上传图 → user 专属文案（无路径/无法重截，审计 P2-3）。
             blocks.append({
                 "type": "text",
-                "text": _IMAGES_OMITTED_NOTE.format(n=len(raw_images)),
+                "text": _USER_IMAGES_OMITTED_NOTE.format(n=len(raw_images)),
             })
         for img in images:
             if isinstance(img, dict):
@@ -1165,7 +1175,8 @@ class GoogleHandler(FormatHandler):
         raw_images = msg.get("images") or []
         images = raw_images if supports_images else []
         if raw_images and not supports_images:
-            parts.append({"text": _IMAGES_OMITTED_NOTE.format(n=len(raw_images))})
+            # 用户上传图 → user 专属文案（无路径/无法重截，审计 P2-3）。
+            parts.append({"text": _USER_IMAGES_OMITTED_NOTE.format(n=len(raw_images))})
         for img in images:
             if isinstance(img, dict):
                 parts.append({

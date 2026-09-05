@@ -639,7 +639,16 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
     # BUG-036: JSON-structured user message
     import json as _json
     user_msg = _json.dumps({"from": "用户", "content": message}, ensure_ascii=False)
-    result = await agent.chat(user_msg)
+    # 用户发图喂 LLM：data URL → 内部格式，经 opts 穿到本轮 user 消息与
+    # conversation 用户 turn（chat_messages 已存原图供 UI，此处只喂模型）。
+    # 无图路径保持原单参调用，行为逐字不变；busy insert / inbox 排队仍纯文本。
+    from hiveweave.services.vision import parse_user_images
+
+    user_images = parse_user_images(images) if images else []
+    if user_images:
+        result = await agent.chat(user_msg, {"images": user_images})
+    else:
+        result = await agent.chat(user_msg)
 
     if result.get("error") == "busy":
         await send_fn(

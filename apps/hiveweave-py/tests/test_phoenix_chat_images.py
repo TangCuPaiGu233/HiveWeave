@@ -25,7 +25,9 @@ def _make_idle_agent() -> SimpleNamespace:
         chat_calls=[],
     )
 
-    async def chat(msg: str) -> dict:
+    async def chat(msg: str, *args, **kwargs) -> dict:
+        # 用户发图喂 LLM（B8 后续）：idle 分支现在会带 opts={"images": [...]}
+        # 触发 chat，签名需容忍该可选参数（详见 test_user_images_to_llm.py）。
         agent.chat_calls.append(msg)
         return {"ok": True}
 

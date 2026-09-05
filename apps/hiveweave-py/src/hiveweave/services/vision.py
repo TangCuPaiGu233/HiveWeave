@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import mimetypes
+import re
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,25 @@ log = structlog.get_logger()
 MAX_SCREENSHOT_BYTES = 2_000_000
 # Keep only the newest N image-bearing messages in an active tool loop.
 KEEP_LAST_IMAGES = 2
+
+# 用户上传图（data URL → LLM）限幅：条数与 message_user 对齐；单张按
+# base64 字符数封顶（2.8M chars ≈ 2.1MB 原始字节，略宽于 2MB 文件上限）。
+MAX_USER_IMAGES = 5
+MAX_USER_IMAGE_B64_CHARS = 2_800_000
+# 单条消息图片总量约束（审计 P1-1）：5×2.8M ≈ 10.5MB 原始字节/请求过重，
+# 且落库后逐轮全量重传直到压缩 —— 总 b64 封顶 8M chars，超限按序丢弃。
+MAX_USER_IMAGES_TOTAL_B64_CHARS = 8_000_000
+
+# 溢出剥图备注按消息来源分流（审计 P2-3）：工具截图 agent 可重截、有文件
+# 路径；用户上传图两者皆无 —— 文案不得误导 agent 去 re-screenshot。
+_USER_IMAGE_STRIPPED_NOTE = (
+    "[用户消息附带的图片因上下文预算未注入 — "
+    "如需像素请让用户重发]"
+)
+_TOOL_IMAGE_STRIPPED_NOTE = (
+    "[image stripped from older context — "
+    "re-screenshot if you still need pixels]"
+)
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
@@ -129,6 +149,83 @@ def load_image_for_llm(
     }
 
 
+def parse_user_images(data_urls: Any) -> list[dict[str, str]]:
+    """Parse user-uploaded image payloads into internal ``{media_type, data}`` dicts.
+
+    Frontend sends data URLs (``data:image/png;base64,XXXX``) over WS chat
+    push and REST ``POST /api/chat``. chat_messages already stores the
+    originals (UI display); this list is what the LLM actually sees.
+
+    Fail-open: invalid entries (non-string / bad prefix / non-base64 /
+    bad charset / non-image mime / empty / over-size) are skipped with a
+    log, never raise. Caps: at most :data:`MAX_USER_IMAGES` images, each
+    base64 payload at most :data:`MAX_USER_IMAGE_B64_CHARS` chars, and the
+    whole message's base64 total at most
+    :data:`MAX_USER_IMAGES_TOTAL_B64_CHARS` (over-budget images dropped
+    in order).
+    """
+    if not isinstance(data_urls, list):
+        return []
+    out: list[dict[str, str]] = []
+    total_b64 = 0
+    for idx, raw in enumerate(data_urls):
+        if len(out) >= MAX_USER_IMAGES:
+            log.warning(
+                "vision.user_images_capped",
+                max_images=MAX_USER_IMAGES,
+                dropped=len(data_urls) - MAX_USER_IMAGES,
+            )
+            break
+        if not isinstance(raw, str):
+            log.info("vision.user_image_skip_non_string")
+            continue
+        s = raw.strip()
+        if not s.startswith("data:"):
+            log.info("vision.user_image_bad_prefix", preview=s[:32])
+            continue
+        header, _, b64 = s.partition(",")
+        if "base64" not in header:
+            log.info("vision.user_image_not_base64", preview=header[:64])
+            continue
+        media_type = header[len("data:"):].split(";", 1)[0].strip() or "image/png"
+        if not media_type.startswith("image/"):
+            log.info("vision.user_image_not_image", media_type=media_type)
+            continue
+        b64 = b64.strip()
+        if not b64:
+            log.info("vision.user_image_empty_data")
+            continue
+        # base64 字符集校验（审计 P2-1）：脏字符（@@、! 等）原样进请求体会
+        # 被严格网关整包 400，一条坏图炸掉整条消息。
+        if not re.fullmatch(r"[A-Za-z0-9+/=\s]+", b64):
+            log.info(
+                "vision.user_image_bad_charset",
+                media_type=media_type,
+                preview=b64[:32],
+            )
+            continue
+        if len(b64) > MAX_USER_IMAGE_B64_CHARS:
+            log.warning(
+                "vision.user_image_too_large",
+                chars=len(b64),
+                max_chars=MAX_USER_IMAGE_B64_CHARS,
+            )
+            continue
+        # 聚合上限（审计 P1-1）：总 b64 封顶，越界按序丢弃（不回填后续小图）。
+        if total_b64 + len(b64) > MAX_USER_IMAGES_TOTAL_B64_CHARS:
+            log.warning(
+                "vision.image_aggregate_capped",
+                accepted=len(out),
+                dropped_remaining=len(data_urls) - idx,
+                total_b64_chars=total_b64,
+                cap_chars=MAX_USER_IMAGES_TOTAL_B64_CHARS,
+            )
+            break
+        total_b64 += len(b64)
+        out.append({"media_type": media_type, "data": b64})
+    return out
+
+
 def strip_images_from_messages(
     messages: list[dict[str, Any]],
     *,
@@ -155,11 +252,18 @@ def strip_images_from_messages(
         if i in drop and isinstance(m, dict) and "images" in m:
             cleaned = {k: v for k, v in m.items() if k != "images"}
             note = cleaned.get("content") or ""
-            if "[image stripped" not in note:
-                cleaned["content"] = (
-                    f"{note}\n[image stripped from older context — "
-                    f"re-screenshot if you still need pixels]"
-                ).strip()
+            # 按来源分流备注（审计 P2-3）：用户上传图无文件路径、agent 无法
+            # 重截 —— 「re-screenshot / 路径仍在」只对工具截图成立。
+            marker = (
+                _USER_IMAGE_STRIPPED_NOTE
+                if m.get("role") == "user"
+                else _TOOL_IMAGE_STRIPPED_NOTE
+            )
+            if (
+                _USER_IMAGE_STRIPPED_NOTE not in note
+                and _TOOL_IMAGE_STRIPPED_NOTE not in note
+            ):
+                cleaned["content"] = f"{note}\n{marker}".strip()
             out.append(cleaned)
         else:
             out.append(m)
@@ -168,11 +272,24 @@ def strip_images_from_messages(
 
 def messages_without_images(
     messages: list[dict[str, Any]],
+    *,
+    keep_user: bool = False,
 ) -> list[dict[str, Any]]:
-    """Strip all image payloads (for conversation-store persistence)."""
+    """Strip image payloads (for conversation-store persistence).
+
+    ``keep_user=True`` preserves ``images`` on user turns — user-uploaded
+    images must stay visible in later turns' history (provider renders them
+    per request; text-only models strip at request build). In-flight
+    tool-loop screenshots stay strip-always: pixels are only needed in the
+    current loop; the next turn can re-screenshot.
+    """
     out: list[dict[str, Any]] = []
     for m in messages:
-        if isinstance(m, dict) and "images" in m:
+        if (
+            isinstance(m, dict)
+            and "images" in m
+            and not (keep_user and m.get("role") == "user")
+        ):
             cleaned = {k: v for k, v in m.items() if k != "images"}
             out.append(cleaned)
         else:

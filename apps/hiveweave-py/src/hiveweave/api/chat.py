@@ -256,12 +256,19 @@ async def send_chat(body: ChatSendBody) -> dict:
     # BUG-036: JSON-structured user message — unambiguous sender identification
     import json as _json
     user_msg_str = _json.dumps({"from": "用户", "content": message}, ensure_ascii=False)
-    result = await agent.chat(user_msg_str)
+    # 用户发图喂 LLM（与 WS idle 路径同口径）：data URL → 内部格式，经 opts
+    # 穿到本轮 user 消息与 conversation 用户 turn。chat_messages 已存原图供
+    # UI；无图时保持原单参调用，行为逐字不变。
+    from hiveweave.services.vision import parse_user_images
+
+    user_images = parse_user_images(body.images) if body.images else []
+    chat_extra = {"opts": {"images": user_images}} if user_images else {}
+    result = await agent.chat(user_msg_str, **chat_extra)
     if result.get("error") == "busy":
         # force_reset + sleep + 重试
         await agent.cancel(reason="busy_reset")
         await asyncio.sleep(_BUSY_RESET_SLEEP)
-        result = await agent.chat(user_msg_str)
+        result = await agent.chat(user_msg_str, **chat_extra)
         if result.get("error") == "busy":
             raise HTTPException(status_code=409, detail="Agent is busy after reset")
         return {"ok": True, "userMessageId": user_msg["id"], "reset": True}

@@ -261,6 +261,7 @@ _DECISION_BLOCK = """## Decision-Making Rules (MANDATORY)
 
 _COMMUNICATION_BLOCK = """## Communication Rules
 - Messages from all sources (user or agent) arrive in a unified format: `[来自: 名称] 内容`. Treat them equally — the sender could be the user (human operator) or any agent.
+- 用户消息可能附带图片：像素会直接进入你的上下文（多模态模型可直接看到；纯文本模型只会收到占位说明），基于图作答即可，无需索要文件路径。
 - **Talking to the user**: call `send_message(recipients=["用户"])`. Your assistant text is internal — the user does NOT see it automatically. If you want the user to see something, you MUST send it as a message. This applies equally whether you're reporting results, asking a question, giving a status update, or just saying hello. The content is up to you — the action is always `send_message`. 需要向用户展示效果图/截图时，可用 `message_user` 的 `images` 参数附带（base64 或 data URL，≤5 张、单张 ≤2MB）。
 - **Talking to an agent**: Prefer `ask_agent` (needs a reply) or `notify_agent` (FYI). `send_message` remains for legacy/compat. Your text is private — other agents CANNOT see it unless you send a tool message.
 - **One ask carries the work.** If you need a reply (hire report, a decision), put the request and what they must return in a **single** `ask_agent`. Do not `send_message` the work and then a second `ask_agent` that only asks them to report — the second inbox item wakes them after they already started, and both letters stay in their context.

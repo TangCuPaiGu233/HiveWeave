@@ -328,7 +328,14 @@ async def handle_completion(
 
     # 3. 追加到 conversation store
     # user message + tool turn messages (assistant+tool pairs) + final assistant
-    turn_messages: list[dict] = [{"role": "user", "content": message}]
+    # 用户发图（opts.images，内部格式）随本轮 user turn 持久化 —— 后续轮的
+    # 历史仍能看到用户像素；前缀缓存纪律：images 只出现在本轮新增 user turn，
+    # 不改写历史。in-flight 工具截图仍不落库（下轮可重截图）。
+    user_turn: dict = {"role": "user", "content": message}
+    _user_images = (opts or {}).get("images")
+    if _user_images:
+        user_turn["images"] = _user_images
+    turn_messages: list[dict] = [user_turn]
     # 如果消息保存失败，注入错误反馈让 AI 意识到问题
     if _save_failed:
         turn_messages.append({
@@ -353,10 +360,12 @@ async def handle_completion(
     )
     # Do not persist base64 screenshots into conversation history —
     # they are for the in-flight tool loop only; next turn can re-screenshot.
+    # keep_user=True: user-uploaded images stay on the persisted user turn.
     from hiveweave.services.vision import messages_without_images
 
     await agent._conversation.append_turn(
-        agent.id, agent.project_id, messages_without_images(turn_messages)
+        agent.id, agent.project_id,
+        messages_without_images(turn_messages, keep_user=True),
     )
 
     # 3. Turn exit gates — validate only; scheduler decides continue/park

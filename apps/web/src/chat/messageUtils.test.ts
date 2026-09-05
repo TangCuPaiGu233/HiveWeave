@@ -45,6 +45,43 @@ describe("beginStreamRound", () => {
     expect(beginStreamRound(draft, undefined)).toBe(draft);
   });
 
+  it("同 round 二次调用不重复插（TEST_DSH_44 Bug#2 防御带：replay 乱序重放）", () => {
+    // replay 重放的 round_start 乱序到达：轮线已在段序列中部也必须识别
+    let draft: StreamDraft = {
+      assistantId: "a1",
+      segments: [{ type: "text", content: "第一轮旁白" }],
+    };
+    draft = beginStreamRound(draft, 1);
+    draft = {
+      ...draft,
+      segments: [...draft.segments, { type: "text", content: "第二轮旁白" }],
+    } as StreamDraft;
+    // 二次同轮 round_start（replay 重放）：段序列已含 round 1 边界 → no-op
+    const twice = beginStreamRound(draft, 1);
+    expect(twice).toBe(draft);
+    expect(twice.segments.filter((s) => s.type === "round_boundary")).toHaveLength(1);
+    // 尾部边界已存在的同款场景同样去重
+    const tailDraft: StreamDraft = {
+      assistantId: "a1",
+      segments: [{ type: "text", content: "x" }, { type: "round_boundary", round: 2 }],
+    };
+    expect(beginStreamRound(tailDraft, 2)).toBe(tailDraft);
+  });
+
+  it("不同 round 正常插入（去重只拦同轮号）", () => {
+    let draft: StreamDraft = {
+      assistantId: "a1",
+      segments: [
+        { type: "text", content: "第一轮" },
+        { type: "round_boundary", round: 1 },
+        { type: "text", content: "第二轮" },
+      ],
+    };
+    draft = beginStreamRound(draft, 2);
+    expect(draft.segments[draft.segments.length - 1]).toEqual({ type: "round_boundary", round: 2 });
+    expect(draft.segments.filter((s) => s.type === "round_boundary")).toHaveLength(2);
+  });
+
   it("round_boundary 是独立段——后续 text_delta 不并入，也不会再产生伪 text 标记", () => {
     let draft: StreamDraft = {
       assistantId: "a1",

@@ -23,6 +23,13 @@ export function beginStreamRound(draft: StreamDraft, round?: number): StreamDraf
   // 标注产出 round_boundary）同 kind，live 与 done reload 走同一渲染分支。
   // round 0 起号，与旧标记同阈值：round>=1（即第 2 轮起）才插。
   if (!round || round < 1) return draft;
+  // 同 round 去重（TEST_DSH_44 Bug#2 防御带）：WS rejoin 时 event_bus 的
+  // per-agent replay 环可能重放已处理过的 round_start（且乱序）——同轮号
+  // 的 round_boundary 段已存在（任意位置，不限尾部）则跳过，否则插出
+  // 「中间无内容」的孤儿分隔线。不同轮号照插。
+  if (draft.segments.some((s) => s.type === "round_boundary" && s.round === round)) {
+    return draft;
+  }
   return {
     ...draft,
     segments: [...draft.segments, { type: "round_boundary", round }],

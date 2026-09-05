@@ -39,11 +39,13 @@ RECENT_ACTIVITY_BUFFER = 100
 AGENT_REPLAY_BUFFER = 50
 """单 agent 事件重放缓冲区大小。参考 DeepTutor StreamBus replay 模式：
 新订阅者加入 agent 频道时，立即重放缓冲的最近事件，避免因 WebSocket
-join 延迟而丢失 tool_call / round_start / done 等关键事件。
+join 延迟而丢失 tool_call / done 等关键事件。
 
-不缓冲 text_delta / thinking_delta / thinking：一轮流式即可写满 50 条，
-会把 round_start 挤出队列，切回 agent 时前端在已有 tool 段后追加新正文
-→ 同一气泡叠三遍复述。正文以 live 流 + DB 累积器为准。"""
+不缓冲 text_delta / thinking_delta / thinking / round_start（TEST_DSH_44
+Bug#2）：deltas 不重放，重放的裸 round_start 没有任何伴随内容——前端
+beginStreamRound 会插出「中间无内容」的孤儿轮次分隔线；且一轮流式即可
+写满 50 条，会把 tool_call 挤出队列。正文与轮次结构以 live 流 + DB 累积
+器 / metadata.segments 快照兜底为准。"""
 
 MAX_SUBSCRIBERS = 100
 """最大订阅者总数（跨所有频道）。R3 fix: 防止恶意客户端创建大量订阅耗尽内存。"""
@@ -55,9 +57,11 @@ _DELTA_ONLY_TYPES: frozenset[str] = frozenset(
     {"text_delta", "thinking_delta", "start", "thinking", "round_start"}
 )
 
-# Token/heartbeat spam must not occupy the 50-slot replay ring (evicts round_start).
+# Token/heartbeat spam 与裸 round_start 不占 50 槽 replay 环（也不进活动环）。
+# round_start：deltas 不重放，重放的裸轮次头无任何伴随内容，纯噪声
+# （TEST_DSH_44 Bug#2 孤儿轮线）；轮次结构由前端 DB 快照兜底。
 _REPLAY_SKIP_TYPES: frozenset[str] = frozenset(
-    {"text_delta", "thinking_delta", "thinking"}
+    {"text_delta", "thinking_delta", "thinking", "round_start"}
 )
 
 

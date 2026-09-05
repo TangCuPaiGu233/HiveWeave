@@ -1218,11 +1218,36 @@ _UNIX_ONLY_HINTS: dict[str, str] = {
     "sha256sum": "Get-FileHash f -Algorithm SHA256",
     "mktemp": "New-TemporaryFile",
     "pgrep": "Get-Process -Name <名>",
-    "pkill": "Stop-Process -Name <名>",
+    # 45 轮 P0：kill 族等价建议必须指向护栏放行的形式——护栏 deny
+    # stop-process/pkill/taskkill(批量)，suggesting Stop-Process 会把
+    # 「方言正确」的改写再送进护栏拒绝，agent 两头撞墙。
+    "pkill": "按名杀灭会被护栏拒绝（按名误杀曾灭平台宿主）。先 "
+             "Get-Process -Name <名> 查 PID，再 kill <pid>（精确 PID 放行）",
     "sudo": "Windows 无 sudo；平台已按需授权，去掉 sudo 直接跑",
     "man": "Get-Help <命令>",
     "dos2unix": "(Get-Content f -Raw) -replace \"`r`n\",\"`n\" | "
                 "Set-Content f -NoNewline",
+    # ── 45 轮 s3-clone_10 实锤/盘点补充（pwsh 无同名命令或 builtin）──
+    "export": "$env:NAME='val'（pwsh 无 export，赋值即生效）",
+    "od": "Format-Hex -Path f（字节转储）",
+    "xxd": "Format-Hex -Path f",
+    "base64": "[Convert]::ToBase64String([IO.File]::ReadAllBytes(f))；"
+              "解码用 [Convert]::FromBase64String",
+    "uname": "无等价；系统信息看 $PSVersionTable",
+    "id": "whoami（当前用户）",
+    "strings": "Select-String -Path f -Pattern '[\\x20-\\x7E]{4,}'（或 python 一行）",
+    "tac": "$c=Get-Content f; [Array]::Reverse($c); $c",
+    "rev": "-join ($s[-1..-$s.Length])",
+    "shuf": "Get-Random -InputObject $arr -Count $arr.Count",
+    "split": "分批用 Get-Content f | Select-Object -Skip N -First M 逐段写出",
+    "column": "Format-Table",
+    "paste": "两文件并排少用；Import-Csv 或 python 一行",
+    "join": "Import-Csv 后按 key 合并，或 python 一行",
+    "iconv": "[IO.File]::ReadAllText(f, [Text.Encoding]::GetEncoding('源编码'))",
+    "nohup": "后台用 bash 工具的 background 参数，或 Start-Process -NoNewWindow",
+    "time": "Measure-Command { … }",
+    "lsof": "端口看 netstat -ano；文件句柄看 Get-Process | Select-Object Id,ProcessName,Path",
+    "wait": "Wait-Process -Id <pid>",
 }
 
 # 类 2：pwsh 有同名别名/同名 exe，但 unix flag 语义对不上 —— 会报参数错误
@@ -1240,7 +1265,8 @@ _ALIAS_FLAG_HINTS: dict[str, str] = {
     "sort": "Sort-Object -Unique（system32\\sort.exe 不认 -u，会静默排错）",
     "find": "Get-ChildItem -Recurse -File -Filter '*.py'"
             "（system32\\find.exe 是查字符串，不是查文件）",
-    "kill": "Stop-Process -Id <pid> -Force",
+    "kill": "裸 kill <pid> 即温和终止（护栏放行）；顽固进程 "
+            "taskkill //PID <pid> //F（仅你自己启动的进程）",
     "ps": "Get-Process（ps aux 会把 aux 当进程名）",
     "tee": "Tee-Object -FilePath f（-a 用 -Append）",
     "diff": "Compare-Object (Get-Content a) (Get-Content b)",
@@ -1336,6 +1362,21 @@ def detect_untranslated_unix(command: str) -> str | None:
             "用 here-string：@'\n  …多行内容…\n  '@ | python -\n"
             "  或先把内容写临时文件（write_file 工具）再按文件处理。"
         )
+
+    # 45 轮 P0：bash 环境变量前缀 `VAR=val cmd`。pwsh 命令位不认赋值
+    # （要 $env:VAR='val'），executor 提示词已写明「必然失败」，但 gate
+    # 此前放行 → 白烧一轮才收到 pwsh 原生报错。语法层前置拒绝。
+    # 锚定段首 token，段内引号串不受影响（`python -c "a=1"` 首 token
+    # 是 python，不命中；$env:/& 开头的 pwsh 原生形式也不命中）。
+    for segment in _split_command_segments(command):
+        if re.match(r"^\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s+\S", segment):
+            return (
+                "Error: bash environment-prefix idiom fails in pwsh — "
+                "assignment is not a command there:\n"
+                "  VAR=val cmd → $env:VAR='val'; cmd（或 $env:VAR='val' "
+                "换行后再跑命令）\n"
+                "Rewrite with $env: assignments, then rerun."
+            )
 
     hits: list[str] = []
     seen: set[str] = set()

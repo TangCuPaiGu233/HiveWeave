@@ -16,6 +16,8 @@ from __future__ import annotations
 import pytest
 
 from hiveweave.tools.bash import (
+    _ALIAS_FLAG_HINTS,
+    _UNIX_ONLY_HINTS,
     _pwsh_dialect_gate,
     _segment_head_token,
     _split_command_segments,
@@ -268,3 +270,53 @@ async def test_execute_bash_pwsh_dialect_skips_gate(
     )
     assert result["success"] is True
     assert result["exit_code"] == 0
+
+
+# ── 45 轮 P0 补充：新动词（od 实锤）/ env 前缀语法层 / kill 族护栏对齐 ──
+
+
+def test_detect_flags_od_from_s3c10_pipeline():
+    """s3-clone_10 实锤：`git show … | od -c | head -5` 中 od 此前不在表内。"""
+    msg = detect_untranslated_unix("git show main:reqs.txt | od -c | head -5")
+    assert msg is not None
+    assert "od" in msg
+    assert "head" in msg
+
+
+def test_detect_flags_bash_env_prefix():
+    msg = detect_untranslated_unix("FOO=bar python -m pytest -q")
+    assert msg is not None
+    assert "environment-prefix" in msg
+    assert "$env:VAR='val'" in msg
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "$env:FOO='bar'; python -m pytest -q",   # pwsh 原生赋值
+        "python -c \"a=1; print(a)\"",           # 引号内 = 不在段首
+        "git -c core.autocrlf=false log --oneline",  # -c 选项不是段首 VAR=
+        "pytest -q 2>&1 | Select-Object -Last 15",   # pwsh 原生管道尾
+    ],
+)
+def test_detect_env_prefix_clean_forms_not_blocked(command):
+    assert detect_untranslated_unix(command) is None
+
+
+def test_gate_blocks_env_prefix(gate_on):
+    msg = _pwsh_dialect_gate("FOO=bar python -m pytest -q")
+    assert msg is not None
+    assert "environment-prefix" in msg
+
+
+@pytest.mark.parametrize("verb", ["pkill", "kill"])
+def test_kill_hints_do_not_suggest_guard_denied_forms(verb):
+    """kill 族等价建议不得指向护栏 deny 的 Stop-Process（两头撞墙）。"""
+    hint = _UNIX_ONLY_HINTS.get(verb) or _ALIAS_FLAG_HINTS.get(verb) or ""
+    assert "stop-process" not in hint.lower()
+    assert "kill <pid>" in hint  # 护栏放行的精确 PID 形式
+
+
+def test_new_verbs_present_in_tables():
+    for v in ("od", "export", "base64", "uname", "lsof", "time"):
+        assert v in _UNIX_ONLY_HINTS, v

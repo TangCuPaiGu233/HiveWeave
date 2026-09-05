@@ -908,3 +908,109 @@ def test_run_subagent_error_without_reason_is_unknown_class():
     assert "status=error" in err
     assert "class=unknown" in err
     assert "reason=unknown reason" in err  # 展示兜底，非分类依据
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 45 轮 P1「子代理断流空等」：upstream 类 stream error 自动退避重试
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_run_subagent_stream_idle_error_retried_and_recovered():
+    """75s idle 帽死一次 → 自动重试一次成功（旧代码一次即终局）。"""
+    parent = _fake_parent()
+    calls = {"n": 0}
+
+    class FlickerStreamer:
+        def __init__(self, **kw):
+            pass
+
+        async def stream(self, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"status": "error", "error": "Stream idle timeout (75s)"}
+            return {"status": "ok", "content": "recovered"}
+
+    with patch("hiveweave.tools.subagent.Streamer", FlickerStreamer), patch(
+        "hiveweave.tools.subagent.compute_backoff",
+        lambda attempt, retry_after_ms=None: 0,
+    ):
+        import asyncio
+
+        result = asyncio.run(_run_subagent(parent, "x", "y", None, "readonly"))
+    assert result["status"] == "ok"
+    assert result["content"] == "recovered"
+    assert calls["n"] == 2
+
+
+def test_run_subagent_logic_error_not_retried():
+    """logic 类失败（子侧问题）不重试——原样透传给父改 prompt。"""
+    parent = _fake_parent()
+    calls = {"n": 0}
+
+    class LogicFailStreamer:
+        def __init__(self, **kw):
+            pass
+
+        async def stream(self, **kw):
+            calls["n"] += 1
+            return {
+                "status": "error",
+                "error": "permission denied: write outside workspace",
+            }
+
+    with patch("hiveweave.tools.subagent.Streamer", LogicFailStreamer):
+        import asyncio
+
+        result = asyncio.run(_run_subagent(parent, "x", "y", None, "readonly"))
+    assert result["status"] == "error"
+    assert "permission denied" in result["error"]
+    assert calls["n"] == 1
+
+
+def test_run_subagent_stream_error_exhausted_retries_annotates():
+    """重试预算耗尽仍失败 → error 文案带 auto-retried 事实位。"""
+    parent = _fake_parent()
+    calls = {"n": 0}
+
+    class AlwaysIdleStreamer:
+        def __init__(self, **kw):
+            pass
+
+        async def stream(self, **kw):
+            calls["n"] += 1
+            return {"status": "error", "error": "Stream idle timeout (75s)"}
+
+    with patch("hiveweave.tools.subagent.Streamer", AlwaysIdleStreamer), patch(
+        "hiveweave.tools.subagent.compute_backoff",
+        lambda attempt, retry_after_ms=None: 0,
+    ), patch("hiveweave.tools.subagent._SUBAGENT_STREAM_RETRIES", 1):
+        import asyncio
+
+        result = asyncio.run(_run_subagent(parent, "x", "y", None, "readonly"))
+    assert result["status"] == "error"
+    assert "auto-retried 1x" in result["error"]
+    assert calls["n"] == 2  # 预算显式钉 1 次重试（不依赖进程级默认）
+
+
+def test_identity_includes_dialect_section_on_pwsh_host(monkeypatch):
+    """45 轮 P0：pwsh 宿主上子代理身份必须带方言段（此前只有 executor 剧本有）。"""
+    parent = _fake_parent()
+    monkeypatch.setattr(
+        "hiveweave.tools.bash._pwsh_is_effective_shell", lambda: True
+    )
+    identity = _subagent_identity(
+        parent, description="x", timeout_s=240,
+        subagent_type="write", workspace="/ws/exec-1")
+    assert "Shell 方言" in identity
+
+
+def test_identity_no_dialect_section_on_native_bash(monkeypatch):
+    """Git Bash 原生宿主 gate 闭口，方言段注入随之关闭。"""
+    parent = _fake_parent()
+    monkeypatch.setattr(
+        "hiveweave.tools.bash._pwsh_is_effective_shell", lambda: False
+    )
+    identity = _subagent_identity(
+        parent, description="x", timeout_s=240,
+        subagent_type="write", workspace="/ws/exec-1")
+    assert "Shell 方言" not in identity

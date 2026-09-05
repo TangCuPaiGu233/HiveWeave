@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from typing import Any
 import structlog
 from pydantic import BaseModel, Field
 
+from hiveweave.llm.retry import compute_backoff
 from hiveweave.llm.streamer import Streamer
 from hiveweave.services.run_ledger import run_ledger as _rl
 from hiveweave.tools.base import tool
@@ -35,6 +37,19 @@ log = structlog.get_logger(__name__)
 SUBAGENT_TIMEOUT_S = 240  # per-subagent explicit deadline; turn budget always on
 SUBAGENT_MAX_TIMEOUT_S = 480
 SUBAGENT_MAX_TOOL_ROUNDS = 100  # 与 run_ledger 默认 budget_tool_calls 一致
+
+# 45 轮 P1「子代理断流空等」：75s stream idle 帽在 streamer 内部转为 error
+# dict 返回（不抛异常），旧代码原样透传 → 子代理一次 idle 死即 [SUBAGENT
+# FAILED] 终局，父级只能空等到 wait TTL。upstream 类错误现在由
+# _run_subagent 的 attempt 循环自动退避重试。上限很小：重试窗（每次 ≤90s
+# idle 窗 + 秒级退避）必须远小于父 wait TTL（15min）与 zombie 帽（300s）。
+_SUBAGENT_STREAM_RETRIES = 1
+try:
+    _SUBAGENT_STREAM_RETRIES = max(
+        0, int(os.getenv("HIVEWEAVE_SUBAGENT_STREAM_RETRIES", "1"))
+    )
+except ValueError:
+    pass
 
 # ──────────────────────────────────────────────────────────────────────────
 # 子代理类型 → 工具白名单（唯一权威）
@@ -403,6 +418,24 @@ def _subagent_identity(
         )
     if ws_line:
         lines.append(ws_line.lstrip("\n"))
+    # 45 轮 P0 旁证：子代理拿不到 executor 剧本的方言段（coordinator 生的
+    # 子代理 3 次方言失败）——身份是子代理唯一的系统提示，pwsh 宿主上一律
+    # 注入，与子代理类型无关（bash 系工具在各类型白名单里都可能出现）。
+    # Git Bash 原生宿主（沙箱 off）gate 闭口，方言段注入也随之关闭。
+    try:
+        from hiveweave.prompts.executor import _SHELL_DIALECT_SECTION
+        from hiveweave.tools.bash import _pwsh_is_effective_shell
+
+        if _pwsh_is_effective_shell():
+            # 子代理适配注：各类型白名单无 pwsh 工具、readonly 无写工具——
+            # bash 工具命令原样交 pwsh 执行，PowerShell 写法直接写进 bash。
+            lines.append(
+                _SHELL_DIALECT_SECTION
+                + "\n\n（子代理附注：上文提到的工具若不在你的工具列表里，"
+                "忽略对应句；PowerShell 写法直接写进 bash 工具即可。）"
+            )
+    except Exception as e:
+        log.debug("subagent_dialect_section_skip", error=str(e))
     return "\n".join(lines)
 
 
@@ -600,58 +633,120 @@ async def _run_subagent(
             usage_sink=parent._pending_usage.append,
         )
 
-    try:
-        if timeout_s is None or timeout_s <= 0:
-            result = await _new_stream_coro()
-        else:
-            result = await asyncio.wait_for(_new_stream_coro(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        # 对齐主 agent 恢复语义（39 审计）：主 agent turn 失败后平台自动
-        # retrigger 续跑；子代理此前一次超时即 [SUBAGENT FAILED] 终局。
-        # 自动重试一次（全新窗口）——SSL 风暴/网关抖动类瞬时故障两次窗口
-        # 连乘后仍失败，才真正 FAILED 通知父。
-        log.warning(
-            "subagent_timeout_retry_once",
-            sub_id=sub_id,
-            timeout_s=timeout_s,
-        )
+    # ── attempt 循环 ──────────────────────────────────────────────
+    # 两类可原样重试的失败，统一在一个循环里收口：
+    # 1. 显式墙钟超时（wait_for TimeoutError）→ 39 审计的 retry-once，
+    #    语义保持（重试一次、无退避等待、终局文案不变）；
+    # 2. stream error 且分类=upstream（45 轮 P1 新增）：75s idle 帽抛
+    #    PermanentError 后 streamer 返回 error dict（core.py 不抛异常），
+    #    旧代码直接透传 → 一次 idle 死即终局（主循环同错误走 recovery
+    #    checkpoint+冷却自动整轮续跑 —— 重试不对称的精确位置）。退避用
+    #    llm/retry.compute_backoff（秒级起 ±25% jitter）。
+    # HTTP 层异常（connect/SSL 抛出路径）不在此重试——retry.py 已做 5 层。
+    result: dict[str, Any] = {}
+    stream_retries = 0
+    timeout_retried = False
+    while True:
+        timed_out = False
         try:
-            result = await asyncio.wait_for(_new_stream_coro(), timeout=timeout_s)
+            if timeout_s is None or timeout_s <= 0:
+                result = await _new_stream_coro()
+            else:
+                result = await asyncio.wait_for(
+                    _new_stream_coro(), timeout=timeout_s
+                )
         except asyncio.TimeoutError:
+            timed_out = True
+        except Exception as e:  # noqa: BLE001 — 网络/熔断等，转 err 不炸父
+            infra_err = f"{type(e).__name__}: {e}"
+            if timeout_retried or stream_retries:
+                infra_err = f"subagent retry failed: {e}"
+                reason = f"retry failed: {e}"
+            else:
+                reason = infra_err
             await _record_subagent_step(
                 parent, status="failed",
                 run_id=snap_run_id, counter=snap_step_counter,
-                reason=(
-                    f"timed out after {timeout_s:g}s "
-                    "(auto-retried once; upstream gateway likely degraded)"
-                ),
-                child_status="timeout",
+                reason=reason,
             )
-            return {
-                "status": "error",
-                "error": (
-                    f"subagent timed out after {timeout_s:g}s "
-                    "(auto-retried once; upstream gateway likely degraded — "
-                    "check provider/proxy, then re-spawn)"
-                ),
-            }
-        except Exception as retry_err:  # noqa: BLE001 — 重试轮的基础设施错误
-            await _record_subagent_step(
-                parent, status="failed",
-                run_id=snap_run_id, counter=snap_step_counter,
-                reason=f"retry failed: {retry_err}",
+            return {"status": "error", "error": infra_err}
+
+        if not timed_out and result.get("status") == "ok":
+            break
+
+        if timed_out:
+            err_text = f"timed out after {timeout_s:g}s"
+            # 两类重试互斥（审计 M1）：串连会让显式超时路径的最坏墙钟涨到
+            # ~3×timeout_s（480s 档 ≈24min > 父 wait TTL 15min）。互斥后
+            # 上界回到旧水平（2×timeout_s 或 1+N 个 idle 窗）。
+            can_retry = not timeout_retried and not stream_retries
+        else:
+            err_text = str(result.get("error") or "")
+            can_retry = (
+                not timeout_retried
+                and stream_retries < _SUBAGENT_STREAM_RETRIES
+                and _subagent_failure_class(
+                    err_text, result.get("error_status")
+                )
+                == "upstream"
             )
-            return {
-                "status": "error",
-                "error": f"subagent retry failed: {retry_err}",
-            }
-    except Exception as e:  # 网络/熔断等 — 转 err，不炸父
+        if not can_retry:
+            break
+
+        if timed_out:
+            timeout_retried = True
+            delay_s = 0.0
+            log.warning(
+                "subagent_timeout_retry_once",
+                sub_id=sub_id, timeout_s=timeout_s,
+            )
+        else:
+            stream_retries += 1
+            delay_ms = compute_backoff(stream_retries)  # 2s, 4s, …
+            delay_s = delay_ms / 1000.0
+            log.warning(
+                "subagent_stream_retry",
+                sub_id=sub_id, attempt=stream_retries,
+                delay_ms=delay_ms, upstream_error=err_text[:160],
+            )
+            await asyncio.sleep(delay_s)
+
+    if timed_out:
+        # 显式超时且 retry-once 仍超时 —— 终局（文案保持 39 审计语义）
         await _record_subagent_step(
             parent, status="failed",
             run_id=snap_run_id, counter=snap_step_counter,
-            reason=f"{type(e).__name__}: {e}",
+            reason=(
+                f"timed out after {timeout_s:g}s "
+                "(auto-retried once; upstream gateway likely degraded)"
+            ),
+            child_status="timeout",
         )
-        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        return {
+            "status": "error",
+            "error": (
+                f"subagent timed out after {timeout_s:g}s "
+                "(auto-retried once; upstream gateway likely degraded — "
+                "check provider/proxy, then re-spawn)"
+            ),
+        }
+
+    if stream_retries:
+        if result.get("status") == "ok":
+            log.info(
+                "subagent_stream_retry_recovered",
+                sub_id=sub_id, attempts=stream_retries,
+            )
+        else:
+            # 失败回执带上重试事实：父看到的 [SUBAGENT FAILED] 不再把
+            # 「已自动重试过 N 次」的 upstream 死当首撞处理。
+            result = {
+                **result,
+                "error": (
+                    f"{result.get('error') or 'unknown error'} "
+                    f"(auto-retried {stream_retries}x on upstream-class error)"
+                ),
+            }
 
     # Token metering (F4): 子代理的 LLM usage 归属到父代理
     # （token 由父的模型配置/账户消耗），request_type="subagent" 标记来源，

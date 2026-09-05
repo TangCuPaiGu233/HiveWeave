@@ -61,6 +61,9 @@ class _FlushFile:
     def flush(self) -> None:
         self._f.flush()
 
+    def close(self) -> None:
+        self._f.close()
+
     def fileno(self) -> int:
         return self._f.fileno()
 
@@ -97,12 +100,41 @@ class _TeeStream:
 _LOG_FILE_STREAM: _FlushFile | None = None
 
 
+def _default_log_file() -> Path:
+    # Durable default so a bare `uv run uvicorn` (no .bat script, no env)
+    # still persists logs — the scripts set HIVEWEAVE_LOG_FILE themselves.
+    # Assumes editable install (uv sync); a wheel would resolve to
+    # site-packages/logs, which is harmless and env-overridable.
+    return Path(__file__).resolve().parents[2] / "logs" / "server.out.log"
+
+
+def _under_pytest() -> bool:
+    return "pytest" in sys.modules
+
+
+def _resolve_log_path() -> tuple[str, bool]:
+    """Return ``(log file path, explicitly_requested)``.
+
+    Explicit = HIVEWEAVE_LOG_FILE set (unwritable file is fatal at vital
+    sign). Unset = default path (unwritable file degrades to console),
+    except under pytest — test runs must not append to the ops log the
+    default exists to protect.
+    """
+    explicit_path = (os.getenv("HIVEWEAVE_LOG_FILE") or "").strip()
+    if explicit_path:
+        return explicit_path, True
+    if _under_pytest():
+        return "", False
+    return str(_default_log_file()), False
+
+
 def _configure_logging() -> None:
     """Configure structlog once at import (JSON when HIVEWEAVE_LOG_JSON=1).
 
-    TEST21 M10: when ``HIVEWEAVE_LOG_FILE`` is set, tee every log line to that
-    path with per-write flush so Ctrl+C / kill cannot evaporate a buffered
-    stdout redirect.
+    TEST21 M10: tee every log line to ``HIVEWEAVE_LOG_FILE`` with per-write
+    flush so Ctrl+C / kill cannot evaporate a buffered stdout redirect.
+    When unset, tee to the default logs/server.out.log instead (skipped
+    under pytest) so a bare `uv run uvicorn` still persists logs.
     """
     global _LOG_FILE_STREAM
     json_logs = os.getenv("HIVEWEAVE_LOG_JSON", "").lower() in ("1", "true", "yes")
@@ -125,15 +157,20 @@ def _configure_logging() -> None:
         renderer = structlog.dev.ConsoleRenderer(colors=colors)
 
     log_stream: object = sys.stdout
-    log_path = (os.getenv("HIVEWEAVE_LOG_FILE") or "").strip()
-    if log_path:
+    log_path, _ = _resolve_log_path()
+    if not log_path:
+        # Guard path (pytest) must reset the global, not leave a stale
+        # stream from a previous configure pointing at a dead file.
+        _LOG_FILE_STREAM = None
+    else:
         try:
             _LOG_FILE_STREAM = _FlushFile(Path(log_path))
             log_stream = _TeeStream(sys.stdout, _LOG_FILE_STREAM)
         except OSError as e:
             # Fail closed at lifespan via log_vital_sign; here keep console.
             print(
-                f"WARNING: cannot open HIVEWEAVE_LOG_FILE={log_path!r}: {e}",
+                f"WARNING: cannot open log file {log_path!r} "
+                f"(HIVEWEAVE_LOG_FILE or default): {e}",
                 file=sys.stderr,
             )
             _LOG_FILE_STREAM = None
@@ -156,25 +193,33 @@ log = structlog.get_logger(__name__)
 
 
 def _assert_log_vital_sign() -> None:
-    """TEST21 M10: if a log file was requested, refuse to run without it."""
-    log_path = (os.getenv("HIVEWEAVE_LOG_FILE") or "").strip()
-    if not log_path:
-        return
+    """TEST21 M10: refuse to run without an explicitly requested log file.
+
+    The default fallback path is best-effort: if it cannot be opened or
+    written, degrade to console (configure already warned) instead of
+    blocking boot in environments where the package tree is read-only.
+    """
+    log_path, explicit = _resolve_log_path()
     if _LOG_FILE_STREAM is None:
-        print(
-            f"FATAL: HIVEWEAVE_LOG_FILE={log_path!r} is set but not writable. "
-            "Refusing to start (logs would be lost on kill).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        if explicit:
+            print(
+                f"FATAL: HIVEWEAVE_LOG_FILE={log_path!r} is set but not writable. "
+                "Refusing to start (logs would be lost on kill).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return
     try:
         _LOG_FILE_STREAM.write(
             f'{{"event":"log_vital_sign","path":"{log_path}","ok":true}}\n'
         )
         _LOG_FILE_STREAM.flush()
     except OSError as e:
-        print(f"FATAL: log_vital_sign write failed: {e}", file=sys.stderr)
-        sys.exit(1)
+        if explicit:
+            print(f"FATAL: log_vital_sign write failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"WARNING: log_vital_sign write failed: {e}", file=sys.stderr)
+        return
     log.info("log_vital_sign", path=log_path)
 
 

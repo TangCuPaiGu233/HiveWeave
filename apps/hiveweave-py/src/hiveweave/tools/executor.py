@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
 import time
@@ -890,7 +892,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         ),
         "properties": {
             "name": {"type": "string"},
-            "role": {"type": "string", "description": "Chinese job title (display label — does NOT set permission; use permissionType). For executors MUST include owned module, e.g. 签到排行榜工程师 / 认证API工程师 — NOT bare 前端工程师."},
+            "role": {"type": "string", "description": "Chinese job title (display label — does NOT set permission; use permissionType). Optional when templateId supplies it. For executors MUST include owned module, e.g. 签到排行榜工程师 / 认证API工程师 — NOT bare 前端工程师."},
             "permissionType": {
                 "type": "string",
                 "enum": ["ceo", "hr", "qa", "coordinator", "executor"],
@@ -914,9 +916,18 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 ),
             },
             "parentId": {"type": "string", "aliases": ["parent_id", "parent", "parentAgentId", "parent_agent_id"]},
-            "templateId": {"type": "string", "aliases": ["template_id"]},
+            "templateId": {
+                "type": "string",
+                "aliases": ["template_id"],
+                "description": (
+                    "Optional. ID from list_agent_templates. Pre-fills empty "
+                    "role/goal/backstory; explicitly passed args win. Unknown "
+                    "id → error (query list_agent_templates first)."
+                ),
+            },
         },
-        "required": ["name", "role"],
+        # role 可省 —— templateId 预填（无模板且缺 role → 工具明确报错）
+        "required": ["name"],
     },
     "read_charter": {
         "description": "Read the organization charter (mission, rules).",
@@ -1979,6 +1990,16 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "properties": {
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
             "priority": {"type": "string", "aliases": ["level"]},
+            "images": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional. Images shown to the user with the message "
+                    "(效果图/截图). Each item is base64 or a data URL; max 5 "
+                    "images, each up to ~2MB — compress or split into more "
+                    "messages if larger."
+                ),
+            },
         },
         "required": ["message"],
     },
@@ -2281,6 +2302,108 @@ async def _emit_tool_execute_after(
         log.debug("tool_execute_after_hook_failed", error=str(e))
 
 
+# 件1（R7 恶化项处置 2026-09-05）：失败→同 agent 同工具成功后回填解法。
+# pending 键 (agent_id, tool_name) → {"project_id", "sig", "ts"}；进程级
+# 并发用 asyncio.Lock 保护（照 db/meta.py _init_lock 模式）。
+_PENDING_SOLUTIONS: dict[tuple[str, str], dict[str, Any]] = {}
+_PENDING_SOLUTIONS_LOCK = asyncio.Lock()
+#: pending 兑现窗口 —— 超时视为该失败已被放弃/换路，丢弃防 dict 单调膨胀。
+_PENDING_SOLUTIONS_TTL_S = 6 * 3600
+
+# P1-2（审计 2026-09-05）：解法回填脱敏 —— tool_args 按键名脱敏后才写进
+# scope='project' 共享 memories，否则 bash command/env 里的密钥（curl -H
+# "Authorization: Bearer …"、export API_KEY 等）会经 known_signature_hint
+# 广播给全员。键名命中（大小写不敏感）→ 值只落「<已隐藏，长度 N>」；
+# 嵌套 dict/list 递归同规则。
+_SENSITIVE_KEY_RE = re.compile(
+    r"token|secret|password|passwd|authorization|auth|credential|api[-_]?key|env",
+    re.IGNORECASE,
+)
+
+
+def _redact_for_shared_solution(value: Any) -> Any:
+    """按参数键名递归脱敏（供共享签名条目的解法摘要使用）。"""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if isinstance(k, str) and _SENSITIVE_KEY_RE.search(k):
+                out[k] = f"<已隐藏，长度 {len(str(v))}>"
+            else:
+                out[k] = _redact_for_shared_solution(v)
+        return out
+    if isinstance(value, list):
+        return [_redact_for_shared_solution(v) for v in value]
+    return value
+
+
+def _has_nonempty_param_value(value: Any) -> bool:
+    """参数里是否至少有一个非空叶子值（P1-3：空参数解法=零信息量）。"""
+    if isinstance(value, dict):
+        return any(_has_nonempty_param_value(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_nonempty_param_value(v) for v in value)
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+async def _f10_pending_success_backfill(
+    result: dict[str, Any],
+    tool_name: str,
+    tool_args: dict[str, Any],
+    agent_id: str,
+) -> None:
+    """同 agent 同工具失败后的首次成功 → 把成功参数摘要回填进签名条目。
+
+    42 轮实测 18/18 hint 无效的根因：条目只有错误原文没有解法，且常由
+    失败者自己刚写。解法 = 本次成功调用的参数摘要（≤200 字符，纯机械
+    回填，无 LLM 总结；先按键名脱敏，见 _redact_for_shared_solution）。
+    命中即清 pending；无 pending 的成功只花一次 dict 查询。
+    P1-3（审计）：空参数（{} / 全空值）不回填 ——「已验证解法: {}」会让
+    _signature_has_solution 恢复对全员广播「先读它」，正是自指抑制闸要防
+    的镜子条目换马甲；无实质参数即消费 pending 后直接弃。
+    best-effort，绝不影响工具回执。
+    """
+    if not result or not result.get("success"):
+        return
+    try:
+        async with _PENDING_SOLUTIONS_LOCK:
+            pending = _PENDING_SOLUTIONS.pop((agent_id, tool_name), None)
+        if not pending:
+            return
+        # 备注①（审计 2026-09-05）：pop 后补 TTL 检查 —— 超窗口的 pending
+        # 不兑现（失败方早已换路，迟到的"解法"只会误导）。
+        if time.time() - float(pending.get("ts") or 0) > _PENDING_SOLUTIONS_TTL_S:
+            return
+        # P1-3：至少一个非空参数值才值得回填
+        if not _has_nonempty_param_value(tool_args):
+            return
+        try:
+            summary = json.dumps(
+                _redact_for_shared_solution(tool_args),
+                ensure_ascii=False,
+                default=str,
+            )
+        except Exception:  # noqa: BLE001 — 摘要失败降级 str()
+            summary = str(_redact_for_shared_solution(tool_args))
+        normalized = summary.strip()[:200]
+        if normalized in ("{}", "[]", "null", '""', ""):
+            return
+        solution = f"同工具失败后一次成功执行的参数: {normalized}"
+        from hiveweave.services.failure_signature import backfill_solution
+
+        await backfill_solution(
+            pending.get("sig") or "",
+            tool_name,
+            solution,
+            project_id=pending.get("project_id"),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("f10_pending_backfill_failed", error=str(e))
+
+
 # F10（平台修复计划 2026-08-30）：失败签名广播 —— 撞到新失败签名写入项目
 # 共享空间（供其他 Agent 前置检索）；命中已知签名的错误回执附 shared-fix 提示
 # （让「先查共享空间」从文案变成行为）。
@@ -2297,6 +2420,7 @@ async def _f10_result_hooks(
         from hiveweave.services.failure_signature import (
             known_signature_hint,
             record_failure_signature,
+            signature_of,
         )
 
         project_id = await get_agent_project_id(agent_id) or None
@@ -2315,6 +2439,24 @@ async def _f10_result_hooks(
             error=error,
             attribution=_attr,
         )
+        # 件1（R7 处置）：写入成功即记 pending —— 同 agent 同工具随后一次
+        # 成功执行时回填成功参数摘要作为解法（_f10_pending_success_backfill）。
+        if isinstance(rec, dict) and rec.get("written") and project_id:
+            _sig_for_pending = signature_of(error)
+            if _sig_for_pending:
+                async with _PENDING_SOLUTIONS_LOCK:
+                    _now_s = time.time()
+                    for _k in [
+                        k
+                        for k, v in _PENDING_SOLUTIONS.items()
+                        if _now_s - v.get("ts", 0) > _PENDING_SOLUTIONS_TTL_S
+                    ]:
+                        _PENDING_SOLUTIONS.pop(_k, None)
+                    _PENDING_SOLUTIONS[(agent_id, tool_name)] = {
+                        "project_id": project_id,
+                        "sig": _sig_for_pending,
+                        "ts": _now_s,
+                    }
         # agent_id 传入供自指抑制留日志；条目无解法信息时不广播（镜子提示）
         # 39 审计 P1-3：首撞者不发自指提示——"先读它"只指向**别人**的条目
         # （首撞者刚写完条目，内容是自己 2 秒前的错误原文，读了零信息量）。
@@ -2499,6 +2641,10 @@ class ToolExecutor:
             registered_result = await _f10_result_hooks(
                 registered_result, name, tool_args, agent_id
             )
+            # 件1：工具成功返回汇聚点（registered 路径）—— pending 兑现回填
+            await _f10_pending_success_backfill(
+                registered_result, name, tool_args, agent_id
+            )
             await _emit_tool_execute_after(
                 agent_id, name, tool_args, registered_result
             )
@@ -2636,6 +2782,9 @@ class ToolExecutor:
             result["output"] = truncated
 
         result = await _f10_result_hooks(result, name, tool_args, agent_id)
+
+        # 件1：工具成功返回汇聚点（legacy 路径）—— pending 兑现回填
+        await _f10_pending_success_backfill(result, name, tool_args, agent_id)
 
         await _emit_tool_execute_after(agent_id, name, tool_args, result)
 

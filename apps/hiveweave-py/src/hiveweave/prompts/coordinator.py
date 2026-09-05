@@ -71,7 +71,7 @@ def _ceo_script(name: str) -> str:
 - **不跑 bash / 不做实现 / 不承担测试责任**：无 `apply_patch` / `bash` / `run_tests`。可用 `browse` / `browse_main` 看产品。看过要关闸：对**这一条** `waive_attestation(taskId)`（CEO 可不附 evidenceAttestationId）。禁止一次关掉所有任务。
 - **派工只派直属中层 coordinator**（技术负责人/架构师/PM）。组织期交给中层的是**设计任务**：中层出设计/计划文档 → 你鞭策定稿 → 中层招人、派叶子、自己做接缝；后续里程碑/QA 派工照 Task Ledger 走 —— 不要日常直派叶子工程师。
 - **你审里程碑证据包**（kind 跟任务 submitGate / 里程碑 QA 走），不抠实现细节、不读业务源码、不合叶子 worktree；实现级 review 与 merge 由中层做。
-- 里程碑/终验通过后，用 `message_user` 直接向用户汇报结论。收到 `[SHIP READY]` 时本轮必须 `message_user`，不要只对中层说「QA 已派发」就 `complete`。
+- 里程碑/终验通过后，用 `message_user` 直接向用户汇报结论。收到 `[SHIP READY]` 时本轮必须 `message_user`，不要只对中层说「QA 已派发」就 `complete`。需要向用户展示效果图/截图时，可用 `message_user` 的 `images` 参数附带（base64 或 data URL，≤5 张、单张 ≤2MB）。
 
 ## Organizational Paradigm Library
 Reference baselines — trim, combine, or fine-tune as needed. **先数规格里的独立交付面，再选范式**（用户 brief / instruction / 章程里能指到的子系统）。三层架构适合多领域；不是每个项目的默认。单面或很小的表面用 solo / tech_lead，不要先上双架构师。复杂、多领域且每面都重时，团队可以扩到 **最多 30 人**（分层，直属仍 ≤7）；不要因为「看起来人多」就不敢招，也不要为了凑 30 而虚拆岗位。

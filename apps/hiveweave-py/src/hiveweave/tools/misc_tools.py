@@ -21,11 +21,11 @@ from urllib.parse import urlparse
 
 import structlog
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from .base import tool
 from .result import ToolResult
-from .helpers import get_project_id
+from .helpers import coerce_to_list, get_project_id
 from hiveweave.util.tree_label import tree_relpath
 
 log = structlog.get_logger(__name__)
@@ -1575,6 +1575,67 @@ class MessageUserParams(BaseModel):
         description="Message priority: 'normal' or 'urgent'.",
         json_schema_extra={"aliases": ["level"]},
     )
+    images: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional images shown to the user together with the message "
+            "(效果效果图/截图). Each item is base64 or a data URL; max 5 "
+            "images, each up to ~2MB."
+        ),
+        json_schema_extra={"aliases": ["image", "picture", "screenshot"]},
+    )
+
+    @field_validator("images", mode="before")
+    @classmethod
+    def _coerce_images(cls, v: Any) -> Any:
+        # LLM 常把数组字段传成裸字符串/JSON 字符串 —— 统一收成 list
+        return coerce_to_list(v)
+
+
+# message_user 图片上限（件3 2026-09-05）：≤5 张、单张 ~2MB 软上限。
+# 2MB 二进制经 base64 膨胀 ~1.37x → 字符数上限取 2_800_000。
+_MESSAGE_USER_MAX_IMAGES = 5
+_MESSAGE_USER_MAX_IMAGE_CHARS = 2_800_000
+
+
+def _validate_message_user_images(
+    images: list[str],
+) -> str | None:
+    """校验 images 参数；返回错误文案（含处方）或 None（合法）。"""
+    if len(images) > _MESSAGE_USER_MAX_IMAGES:
+        return (
+            f"message_user rejected: images 超过 {_MESSAGE_USER_MAX_IMAGES} 张上限"
+            f"（收到 {len(images)} 张）。处方：压缩合并图片，或减少张数、"
+            "分多条 message_user 发送。"
+        )
+    for i, img in enumerate(images, 1):
+        if not isinstance(img, str) or not img.strip():
+            return (
+                f"message_user rejected: images[{i}] 必须是非空字符串"
+                "（data:image/ 开头的 data URL，或 http(s):// 图片 URL）。"
+            )
+        # 备注②（审计 2026-09-05）：前缀白名单 —— 只收 data:image/ 或
+        # http(s):// 开头的串；裸 base64 缺 mime 头前端 <img> 渲染不出，
+        # 本地路径/文本则完全是噪音。
+        low = img.strip().lower()
+        if not (
+            low.startswith("data:image/")
+            or low.startswith("http://")
+            or low.startswith("https://")
+        ):
+            return (
+                f"message_user rejected: images[{i}] 不是可渲染的图片串"
+                "（仅接受 data:image/… 或 http(s)://… 开头）。处方：裸 base64 "
+                "请补前缀成 data:image/<格式>;base64,<数据>；本地文件请先读出"
+                "转 base64，或提供可访问的图片 URL。"
+            )
+        if len(img) > _MESSAGE_USER_MAX_IMAGE_CHARS:
+            return (
+                f"message_user rejected: images[{i}] 超过单张 ~2MB 软上限"
+                f"（{len(img)} chars）。处方：压缩或降分辨率后重发，"
+                "或减少张数分多条发送。"
+            )
+    return None
 
 
 # E4 补（复盘 P0-1 G4「CEO 出口核验」）：完结断言词表——CEO 发布这些措辞
@@ -1702,6 +1763,14 @@ async def message_user_tool(
     if not params.message:
         return ToolResult.err("message_user requires 'message' (body text)")
 
+    # 件3（agent→用户发图 2026-09-05）：可选 images 校验（≤5 张、单张
+    # ~2MB 软上限），超限报错并附处方（压缩/降张数）。
+    images = params.images or []
+    if images:
+        images_err = _validate_message_user_images(images)
+        if images_err:
+            return ToolResult.err(images_err)
+
     # E4 补：CEO 完结断言前账本一致性核验（复盘 G4）——先拦再发。
     block = await _ceo_exit_assertion_block(agent_id, params.message)
     if block:
@@ -1710,7 +1779,7 @@ async def message_user_tool(
     from hiveweave.services.chat_message import ChatMessageService
 
     chat_service = ChatMessageService()
-    await chat_service.save_message({
+    payload: dict[str, Any] = {
         "agent_id": agent_id,
         "role": "assistant",
         "content": params.message,
@@ -1718,15 +1787,28 @@ async def message_user_tool(
         "tool_calls": "[]",
         "is_streaming": False,
         "is_background": False,
-    })
+    }
+    if images:
+        # 落库路径取证：message_user 直接写 chat_messages（用户 Chat 面板
+        # 的消息源），不经 inbox 中转 —— images 列直接落这条消息即可，
+        # metadata.source 标记来源供追溯。
+        payload["images"] = images
+        payload["metadata"] = {"source": "agent_to_user"}
+    await chat_service.save_message(payload)
 
     # Push via WebSocket so the frontend updates in real-time
     try:
         from hiveweave.realtime.event_bus import status_event_bus
 
+        ws_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": params.message,
+        }
+        if images:
+            ws_message["images"] = images
         await status_event_bus.publish_chat_message(
             agent_id=agent_id,
-            message={"role": "assistant", "content": params.message},
+            message=ws_message,
         )
     except Exception as evt_err:
         log.debug("message_user_event_push_failed", error=str(evt_err))

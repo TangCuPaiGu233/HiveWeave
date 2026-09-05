@@ -47,10 +47,12 @@ class HireAgentParams(BaseModel):
     name: str = Field(
         description="Agent codename (e.g. a Chinese flower name).",
     )
-    role: str = Field(
+    role: str | None = Field(
+        default=None,
         description=(
             "Chinese job title. Display label only -- does NOT determine "
-            "permission. Use permissionType to set authority."
+            "permission. Use permissionType to set authority. Optional when "
+            "templateId supplies it; otherwise required."
         ),
     )
     system_prompt: str | None = Field(
@@ -103,7 +105,11 @@ class HireAgentParams(BaseModel):
     template_id: str | None = Field(
         default=None,
         alias="templateId",
-        description="Optional template ID to pre-fill role/goal/skills.",
+        description=(
+            "Optional template ID (from list_agent_templates). Pre-fills "
+            "empty role/goal/backstory from the template; values you pass "
+            "explicitly are NOT overwritten. Unknown id → error."
+        ),
         json_schema_extra={"aliases": ["templateId", "template_id"]},
     )
 
@@ -205,6 +211,42 @@ async def hire_agent_tool(
 
     if not name:
         return ToolResult.err("hire_agent requires 'name' (agent codename)")
+
+    # ── template_id 预填（死参数修复：此前赋值后全文件无消费）──
+    # 必须先于 role 校验（P1-4 审计 2026-09-05）：role 缺省时取 tpl.role，
+    # 模板也没有 role 才在下方 role 校验报错 —— 否则 role 必填使预填不可达，
+    # TOOL_PARAM_SCHEMAS「Pre-fills empty role/goal/backstory」承诺落空。
+    # 映射与已删除的前端 AddAgentDialog 一致：
+    #   role ← tpl.role、goal ← tpl.vibe 或 tpl.description、
+    #   backstory ← tpl.prompt_body —— 只填空位，调用方显式传了的字段不覆盖。
+    # discipline_suite 不映射（语义未定，明确留白）；模板表无 skills 列，
+    # skills 不做模板预填（list_agent_templates 文案已同步为实际可预填字段）。
+    if template_id:
+        if not getattr(ctx, "templates", None):
+            return ToolResult.err(
+                "TemplateService not available (ctx.templates is missing)"
+            )
+        tpl = await ctx.templates.get(template_id)
+        if not tpl:
+            return ToolResult.err(
+                f"模板不存在: {template_id}（可用 list_agent_templates 查询）"
+            )
+        if not role:
+            role = (tpl.get("role") or "").strip()
+        if not goal:
+            goal = (tpl.get("vibe") or "").strip() or (
+                tpl.get("description") or ""
+            ).strip()
+        if not backstory:
+            backstory = (tpl.get("prompt_body") or "").strip()
+        log.info(
+            "tool.hire_agent.template_prefill",
+            template_id=template_id,
+            role=role,
+            goal_filled=bool(goal),
+            backstory_filled=bool(backstory),
+        )
+
     if not role:
         return ToolResult.err("hire_agent requires 'role' (job title)")
 
@@ -716,6 +758,30 @@ async def hire_agent_tool(
         if span_note:
             span_note = f"\n{span_note}\n"
 
+        # Non-blocking staffing guidance (dsh42 实证：招 6 executor 只有
+        # 4 个可做任务位，2 人 Reserve 待命 30min)：hire executor 时若
+        # 待派活任务 < 在编执行者，提示确认是否需要扩编。fail-open —
+        # 任务查询失败就跳过提示，绝不阻断 hire。
+        staffing_note = ""
+        if perm_type == "executor":
+            try:
+                from hiveweave.services.org_invariants import staffing_advisory
+                from hiveweave.services.task import TaskService as _TaskSvc
+
+                open_tasks = await _TaskSvc().list_tasks(project_id)
+                staffing_note = (
+                    staffing_advisory(
+                        agents=existing_agents, tasks=open_tasks
+                    )
+                    or ""
+                )
+                if staffing_note:
+                    staffing_note = f"\n{staffing_note}\n"
+            except Exception as adv_err:
+                log.debug(
+                    "hire_agent.staffing_advisory_failed", error=str(adv_err)
+                )
+
         return ToolResult.ok(
             f"Agent hired successfully.\n"
             f"  Name: {name}\n"
@@ -731,6 +797,7 @@ async def hire_agent_tool(
             f"{retry_note}"
             f"{next_action}"
             f"{span_note}"
+            f"{staffing_note}"
         )
     except Exception as e:
         return ToolResult.err(f"Failed to hire agent: {e}")
@@ -1542,7 +1609,7 @@ async def list_agent_templates_tool(
         f"Available agent templates ({len(templates)} found):\n"
         + "\n".join(lines)
         + "\n\nPass templateId in hire_agent to pre-fill "
-        "role/goal/skills."
+        "role/goal/backstory (explicit args win)."
     )
     return ToolResult.ok(output)
 

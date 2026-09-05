@@ -363,9 +363,9 @@ def tool_hard_deny(agent: dict[str, Any], tool_name: str) -> str | None:
     caps = capabilities_for(agent)
     required = TOOL_CAPABILITY.get(tool_name)
     if required is None:
-        # write_file handled via scope; unknown tools fall through
-        if tool_name == "write_file":
-            return None
+        # write_file 的能力判定走 hard_check → write_path_allowed 的路径
+        # scope（TOOL_CAPABILITY 特意不映射它）；未映射工具已由启动断言
+        # （tool_capability_check）保证有映射或显式豁免，这里统一放行。
         return None
     if caps.isdisjoint(required):
         family = infer_role_family(agent)

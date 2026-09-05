@@ -1374,6 +1374,30 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     # — Network + file ops —
     "webfetch": {
         "description": (
+    "git_worktree_sync": {
+        "description": (
+            "Sync MAIN's new commits into your worktree (MAIN → worktree). "
+            "No-op when already up to date (merged=false, "
+            "reason=up_to_date). Untracked files MAIN would overwrite are "
+            "auto-moved to .hiveweave/merge-quarantine (recoverable — "
+            "listed in the receipt and an inbox notice; the merge still "
+            "completes). Predicted content conflicts are rejected BEFORE "
+            "anything runs (nothing is merged, HEAD unchanged): commit or "
+            "resolve them in your worktree, then retry. Prefer this over "
+            "bare `git merge main`."
+        ),
+        "properties": {
+            "shortId": {
+                "type": "string",
+                "aliases": ["short_id", "agentShortId", "target"],
+                "description": (
+                    "Optional. Sync a subordinate's worktree; omit for "
+                    "your own."
+                ),
+            },
+        },
+        "required": [],
+    },
             "Fetch a URL and extract readable text. Optional prompt to "
             "answer from the page. SSRF-blocked."
         ),

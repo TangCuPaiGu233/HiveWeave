@@ -85,6 +85,7 @@ from .ensure import (
     worktree_commits_behind_main,
 )
 from .dispatch_pin import pin_dispatch_message_to_worktree
+from .service_sync import sync_main_into_worktree
 
 # Submodules that bind patched names into their globals (for LOAD_GLOBAL).
 _PATCH_CONSUMERS = (
@@ -101,6 +102,7 @@ _PATCH_CONSUMERS = (
     "hiveweave.services.git_worktree.reconcile",
     "hiveweave.services.git_worktree.ensure",
     "hiveweave.services.git_worktree.dispatch_pin",
+    "hiveweave.services.git_worktree.service_sync",
 )
 
 _PATCH_NAMES = frozenset({
@@ -173,6 +175,7 @@ __all__ = [
     "agent_gets_write_worktree",
     "pin_dispatch_message_to_worktree",
     "worktree_commits_behind_main",
+    "sync_main_into_worktree",
     "scan_conflict_markers",
     "parse_untracked_overwrite",
     "quarantine_untracked_on_target",

@@ -88,6 +88,7 @@ COORDINATOR_BUILDER_TOOLS = _BASE_TOOLS | frozenset({
     "spawn_subagent",
     "generate_image",
     "git_worktree_checkpoint",
+    "git_worktree_sync",
     "run_code_review", "run_security_audit", "run_perf_audit",
     "run_full_review",
     "request_code_audit",
@@ -121,6 +122,9 @@ READONLY_TOOLS = _BASE_TOOLS | frozenset({
     "delete_directory",
     "run_code_review", "run_security_audit", "run_perf_audit", "run_full_review",
     "git_worktree_checkpoint",
+    # MAIN→worktree 同步（executor/builder 自助把 MAIN 新提交合进自己的树；
+    # capability 硬门 SOURCE_WRITE|MERGE 见 policy.TOOL_CAPABILITY）
+    "git_worktree_sync",
 })
 
 READWRITE_TOOLS = READONLY_TOOLS | frozenset({

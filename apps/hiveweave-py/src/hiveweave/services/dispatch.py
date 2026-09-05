@@ -333,7 +333,10 @@ class DispatchService:
                                 f"{behind} commit(s) behind main. "
                                 f"Run `git merge main` (or `git rebase main`) "
                                 f"in your worktree before starting work to "
-                                f"avoid building on stale code."
+                                f"avoid building on stale code. "
+                                f"可调用 git_worktree_sync 工具完成同步"
+                                f"（护栏版：untracked 冲突自动进隔离区、"
+                                f"内容冲突提前拒绝）。"
                             )
                     except Exception as e:
                         log.debug(

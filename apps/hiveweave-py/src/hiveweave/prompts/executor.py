@@ -513,4 +513,6 @@ Do not hunt sibling trees for specs.
 - Only finalized, reviewed code reaches the project root — via git_worktree_merge (coordinator).
 - **Merge conflict rework**: If you get rework saying MERGE CONFLICT, do NOT write on main.
   In YOUR worktree: merge or rebase `main` into your branch, resolve conflict markers here,
-  `git_worktree_checkpoint`, then re-submit. Coordinator will retry `git_worktree_merge`."""
+  `git_worktree_checkpoint`, then re-submit. Coordinator will retry `git_worktree_merge`.
+- Sync MAIN's new commits into your tree with `git_worktree_sync` (guarded sync —
+  quarantine for untracked collisions, conflict pre-check) instead of bare `git merge main`."""

@@ -119,6 +119,14 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "git_worktree_create": frozenset({Capability.MERGE}),
     "git_worktree_merge": frozenset({Capability.MERGE}),
     "git_worktree_remove": frozenset({Capability.MERGE}),
+    # git_worktree_sync（MAIN→worktree 方向）不是合并权威（那是 MERGE 的
+    # worktree→MAIN 语义）——主要用户是被派单提示引导的 executor（无 MERGE），
+    # 硬门跟"能写源码就能同步自己的树"对齐：SOURCE_WRITE 为主，MERGE 兜底
+    # （CEO 升级救场路径）。与 git_worktree_merge 仅 MERGE 的映射刻意不同。
+    "git_worktree_sync": frozenset({
+        Capability.SOURCE_WRITE,
+        Capability.MERGE,
+    }),
     "bash": frozenset({Capability.BASH_SHELL}),
     "bash_main": frozenset({Capability.BASH_SHELL}),
     # pwsh = bash 的 PowerShell 方言同胞（DSH_33 P0）：同一条执行管线、同一

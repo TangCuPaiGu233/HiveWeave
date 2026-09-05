@@ -6,7 +6,8 @@ Migrated from executor.py ``_tool_*`` methods and inline dispatch code to
 Tools:
     Git worktree:  git_worktree_create, git_worktree_list,
                    git_worktree_merge, git_worktree_remove,
-                   git_worktree_status, git_worktree_checkpoint
+                   git_worktree_status, git_worktree_sync,
+                   git_worktree_checkpoint
     Other:         message_user, webfetch
 """
 
@@ -1271,6 +1272,223 @@ async def git_worktree_status_tool(
         f"short_id={target_sid}, Branch: {branch}, "
         f"dirty={dirty}, head={head}, base={base}, "
         f"tip_is_ancestor_of_main={tip_s}, commits_ahead={ahead_s}"
+    )
+
+
+# ── git_worktree_sync ────────────────────────────────────
+
+
+class GitWorktreeSyncParams(BaseModel):
+    """Parameters for git_worktree_sync tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    short_id: str | None = Field(
+        default=None,
+        alias="shortId",
+        description=(
+            "Agent short_id whose worktree to sync with MAIN (e.g. A004). "
+            "Omit to sync the caller's own worktree. Only your own or a "
+            "direct subordinate's worktree is allowed."
+        ),
+        json_schema_extra={
+            "aliases": ["shortId", "short_id", "agentShortId", "target"]
+        },
+    )
+
+
+async def _resolve_sync_target(
+    caller_agent_id: str,
+    caller_short_id: str,
+    short_param: str | None,
+    ctx=None,
+) -> tuple[str | None, str | None, str | None]:
+    """P1-1 越权门：只准同步自己的 worktree，或**直属 subordinate** 的。
+
+    对任意同伴 worktree 触发 sync = auto-checkpoint（把同伴未提交 WIP
+    提交进其分支）+ 搬走同伴 untracked 文件 —— 超出 SOURCE_WRITE 的写面，
+    必须限组织父子关系。关系查不到一律拒绝（fail-closed）。
+
+    Returns ``(target_sid, target_agent_id, error)``；error 非 None 即拒绝。
+    """
+    wanted = (short_param or "").strip()
+    if not wanted or wanted.upper() == str(caller_short_id or "").upper():
+        return caller_short_id, caller_agent_id, None
+
+    org = None
+    if ctx is not None and getattr(ctx, "org", None) is not None:
+        org = ctx.org
+    else:
+        try:
+            from hiveweave.services.org import OrgService
+
+            org = OrgService()
+        except Exception:
+            org = None
+
+    resolved: dict | None = None
+    if org is not None:
+        try:
+            resolved = await org.resolve_agent(wanted)
+        except Exception:
+            resolved = None
+    if not resolved:
+        return None, None, (
+            f"Refusing to sync: no agent found for '{wanted}'. You may only "
+            "sync your own worktree (omit shortId) or a direct "
+            "subordinate's."
+        )
+
+    target_sid = str(resolved.get("short_id") or wanted)
+    target_agent_id = resolved.get("id")
+    if target_sid.upper() == str(caller_short_id or "").upper():
+        return caller_short_id, caller_agent_id, None
+
+    parent_id = str(resolved.get("parent_id") or "").strip()
+    if not caller_agent_id or parent_id != str(caller_agent_id):
+        return target_sid, target_agent_id, (
+            f"Refusing to sync worktree {target_sid}: it is not your own "
+            "worktree and you are not its direct superior. You may only "
+            "sync your own worktree (omit shortId); for anyone else, ask "
+            "the worktree owner to run git_worktree_sync themselves."
+        )
+    return target_sid, target_agent_id, None
+
+
+@tool(
+    "git_worktree_sync",
+    "Sync MAIN's new commits into an agent worktree (MAIN → worktree). "
+    "Your own tree by default; a direct subordinate's via shortId. "
+    "Up-to-date trees no-op. Untracked worktree files that MAIN's incoming "
+    "commits would overwrite are moved to .hiveweave/merge-quarantine "
+    "(not deleted, recoverable — receipt lists them and an inbox notice "
+    "is sent). Predicted content conflicts are rejected BEFORE anything "
+    "runs — resolve in the worktree, then retry. Use this instead of bare "
+    "`git merge main`.",
+    requires_workspace=True,
+    security_level="standard",
+)
+async def git_worktree_sync_tool(
+    params: GitWorktreeSyncParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    """Sync MAIN's new commits into an agent worktree (MAIN → worktree)."""
+    from hiveweave.services.git_worktree import GitWorktreeService
+    from hiveweave.services.git_worktree.service_sync import (
+        sync_main_into_worktree,
+    )
+
+    wt_ctx = await _get_worktree_context(agent_id, ctx)
+    if isinstance(wt_ctx, ToolResult):
+        return wt_ctx
+    workspace_path, caller_short_id, _project_id = wt_ctx
+
+    # P1-1 越权门：自己的树，或直属 subordinate 的树（组织父子，fail-closed）
+    target_sid, target_agent_id, gate_err = await _resolve_sync_target(
+        agent_id, caller_short_id, params.short_id, ctx
+    )
+    if gate_err or not target_sid:
+        return ToolResult.err(
+            gate_err or "Refusing to sync: could not resolve target worktree."
+        )
+
+    gwt = GitWorktreeService()
+    await gwt.ensure_git_repo(workspace_path)
+
+    result = await sync_main_into_worktree(workspace_path, target_sid)
+
+    # 通知面（审计备注 E）：target ≠ caller 时，隔离/同步通知必须同时发
+    # 文件属主（target agent）一份 —— 不能只发调用者。
+    notify_ids = [agent_id]
+    if target_agent_id and str(target_agent_id) != str(agent_id):
+        notify_ids.append(str(target_agent_id))
+
+    q_events = result.get("quarantined")
+    q_files: list[str] = []
+    if isinstance(q_events, list) and q_events:
+        q_files = [f for e in q_events for f in (e.get("files") or [])]
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            dest = q_events[0].get("dest") or ".hiveweave/merge-quarantine"
+            outcome = (
+                "合并本体不受影响。"
+                if result.get("success")
+                else "本次 sync 最终失败，请先处理失败原因后重试。"
+            )
+            for nid in notify_ids:
+                await InboxService().send_message(
+                    from_agent_id="system",
+                    to_agent_id=nid,
+                    message=(
+                        f"[WORKTREE SYNC QUARANTINE] git_worktree_sync 检测到 "
+                        f"MAIN 新提交将覆写 worktree {target_sid} 里的未跟踪"
+                        f"文件，已搬移到 {dest}（未丢弃，可恢复）：\n- "
+                        + "\n- ".join(q_files[:20])
+                        + "\n恢复指引：进入该目录对比/取回文件后重新提交；"
+                        f"若改动已无价值可忽略。{outcome}"
+                    ),
+                    message_type="task",
+                    priority="urgent",
+                    wake=True,
+                )
+        except Exception as qe:
+            log.warning("sync_quarantine_notify_failed", error=str(qe))
+
+    # 属主告知（E）：别人代同步了你的树 —— 属主必须可发现。
+    if (
+        target_agent_id
+        and str(target_agent_id) != str(agent_id)
+        and result.get("success")
+        and result.get("merged")
+    ):
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().send_message(
+                from_agent_id="system",
+                to_agent_id=str(target_agent_id),
+                message=(
+                    f"[WORKTREE SYNC] 你的 worktree ({target_sid}, branch "
+                    f"{result.get('branch') or '?'}) 由上级代为同步了 MAIN "
+                    f"新提交：new HEAD {result.get('new_head') or '?'}。"
+                    "请 git status 确认工作区状态后再继续编码。"
+                ),
+                message_type="system",
+            )
+        except Exception as ne:
+            log.warning("sync_owner_notify_failed", error=str(ne))
+
+    if not result.get("success"):
+        return ToolResult.err(
+            result.get("message", "git_worktree_sync failed"),
+            reason=result.get("reason"),
+            conflicts=result.get("conflicts") or [],
+            behind_before=result.get("behind_before", 0),
+            quarantined=q_events if isinstance(q_events, list) else [],
+        )
+
+    if not result.get("merged"):
+        return ToolResult.ok(
+            result.get("message", "Worktree already up to date with MAIN."),
+            merged=False,
+            reason=result.get("reason"),
+            new_head=result.get("new_head", ""),
+            behind_before=result.get("behind_before", 0),
+            quarantined=[],
+            conflicts=[],
+        )
+
+    msg = result.get("message") or (
+        f"Synced MAIN into worktree {target_sid} "
+        f"(new HEAD {result.get('new_head', '?')})."
+    )
+    return ToolResult.ok(
+        msg,
+        merged=True,
+        new_head=result.get("new_head", ""),
+        behind_before=result.get("behind_before", 0),
+        quarantined=q_events if isinstance(q_events, list) else [],
+        conflicts=[],
     )
 
 

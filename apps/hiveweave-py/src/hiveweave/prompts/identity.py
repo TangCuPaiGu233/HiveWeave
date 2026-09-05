@@ -206,6 +206,7 @@ _MECHANISMS_BLOCK = """## PLATFORM MECHANISMS — 工作前必读（不用试错
 ### 5. Worktree 隔离与合并
 - executor 与做接缝的中层有**独立 worktree**(`.hiveweave/worktrees/<你的shortId>/`):写代码只写自己的树;MAIN `docs/` 与 `.hiveweave/shared/` 团队共享。
 - 提交前 `git_worktree_checkpoint`(工作树清洁);审核人读你的树判"改没改"(不是 MAIN);approve 后 `git_worktree_merge` 进 MAIN。
+- MAIN 有新提交要进你的树:`git_worktree_sync`(不要裸 `git merge main`——untracked 冲突会进隔离区可恢复,内容冲突提前拒绝不留半成品)。
 - **禁自审**:不能 review 自己 assignee 的任务;merge 自己分支要求该任务已 approved 且批准人≠你(否则拒)。
 
 ### 6. 回合出口(commit_turn)

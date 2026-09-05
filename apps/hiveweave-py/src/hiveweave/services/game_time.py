@@ -804,12 +804,44 @@ class GameTimeService:
                     "ref_agent_id": ref_agent_id,
                     "ref_last_active": ref_last_active,
                 }
-                body = (
-                    f"[WAIT_TIMEOUT] Your wait ({kind}:{ref}) expired. "
-                    f"ask_outstanding={ask_outstanding}. "
-                    "Resume work or re-establish a wait. "
-                    f"details={struct}"
-                )
+                # P2-8（42 轮报告）：timer wait 唤醒文案区分目标到点 vs TTL 封顶。
+                ttl_cap_target = ""
+                wakeup_reason = ""
+                if str(kind).lower() == "timer":
+                    from hiveweave.services.wait_contract import (
+                        wait_target_iso,
+                        wait_wakeup_reason,
+                    )
+
+                    wakeup_reason = wait_wakeup_reason(w) or ""
+                    if wakeup_reason:
+                        struct["wakeup_reason"] = wakeup_reason
+                    if wakeup_reason == "ttl_cap":
+                        ttl_cap_target = wait_target_iso(w) or "?"
+                        struct["wait_target"] = ttl_cap_target
+                if wakeup_reason == "ttl_cap":
+                    body = (
+                        f"[WAIT_TIMEOUT] wakeup_reason=ttl_cap — "
+                        f"这是等待 TTL 上限唤醒，不是目标时刻到点："
+                        f"目标 <{ttl_cap_target}> 未到。"
+                        f"请重新 commit_turn(waiting_on) 续等，"
+                        f"或改用 ScheduledAlarm（schedule_alarm）。 "
+                        f"Your wait ({kind}:{ref}) hit the wait-TTL cap. "
+                        f"details={struct}"
+                    )
+                else:
+                    prefix = (
+                        "wakeup_reason=target_reached — timer target reached. "
+                        if wakeup_reason == "target_reached"
+                        else ""
+                    )
+                    body = (
+                        f"[WAIT_TIMEOUT] {prefix}"
+                        f"Your wait ({kind}:{ref}) expired. "
+                        f"ask_outstanding={ask_outstanding}. "
+                        "Resume work or re-establish a wait. "
+                        f"details={struct}"
+                    )
                 await inbox.send_message(
                     from_agent_id="system",
                     to_agent_id=aid,

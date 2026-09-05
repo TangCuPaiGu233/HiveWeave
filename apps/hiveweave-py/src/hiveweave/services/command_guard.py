@@ -284,6 +284,16 @@ _INDIRECT_PID_HINT = (
     "（可能命中平台宿主进程）。改用字面 PID：先 tasklist / Get-Process "
     "确认进程归属，再 taskkill //PID <数字> //F 或 kill <数字>。"
 )
+_ACL_CHANGE_HINT = (
+    "沙箱内禁用 ACL 变更命令：icacls 会改写 DACL（/grant /deny /remove "
+    "/reset），受限令牌 + 能力 SID 沙箱可被自行改权穿透。请勿变更文件 ACL；"
+    "确需权限调整在任务说明中申请平台侧处理，或改用普通文件读写工具。"
+)
+_TAKEOWN_HINT = (
+    "沙箱内禁用 ACL 变更命令：takeown 会抢夺文件 owner（WRITE_OWNER），"
+    "可绕过受限令牌的访问边界自提权出沙箱。请勿变更所有权；确需调整走"
+    "平台侧处理。"
+)
 
 
 def _pred_rm_recursive_force(tokens: list[str]) -> bool:
@@ -420,6 +430,13 @@ DEFAULT_BASH_RULES: tuple[GuardRule, ...] = (
     # ── 编码包装（无法审计） ──
     GuardRule("powershell *-enc*", "ask", hint=_ENCODED_HINT),
     GuardRule("pwsh *-enc*", "ask", hint=_ENCODED_HINT),
+    # ── Windows ACL 提权/破防（42 轮双项目报告）：受限令牌 + 能力 SID 沙箱
+    #    下，agent 跑 icacls（改 DACL）/ takeown（抢 owner）可自提权出沙箱。
+    #    排在表尾：findLast 后规则覆盖前规则，压过首条 `*` → allow。
+    #    平台自身 ACL 清理（services/acl_sandbox/cleanup.py）走 win32security
+    #    直调，不经 agent bash 护栏，无需豁免。
+    GuardRule("icacls *", "deny", hint=_ACL_CHANGE_HINT),
+    GuardRule("takeown *", "deny", hint=_TAKEOWN_HINT),
 )
 
 # 运行期追加规则（未来 Settings/项目级覆盖入口；追加在默认表之后 → 覆盖默认）

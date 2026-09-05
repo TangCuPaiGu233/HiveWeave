@@ -240,6 +240,67 @@ def span_advisory(
     )
 
 
+def staffing_advisory(
+    *,
+    agents: list[dict[str, Any]],
+    tasks: list[dict[str, Any]] | None,
+) -> str | None:
+    """Non-blocking hint when hiring an executor with more hands than work.
+
+    dsh42 实证：招 6 executor 只有 4 个可做任务位，2 人 Reserve 待命
+    30min，CEO 点名「职责重叠」。本提示在 hire 回执里软引导 HR/中层先看
+    待派活存量再扩编。``tasks`` 传 None / 查询失败时返回 None（fail-open，
+    不阻断 hire）。只统计 executor 可做的 open 任务，口径：未被 claim
+    （无 assignee 的 created/pending 草稿）或**无主** blocked 停靠位 ——
+    blocked 已有 assignee 是「有主的停靠位」，不是可派活存量（P2-3 审计
+    修正，防存量虚高）。VERIFY 任务是 QA 岗活，不计入。
+    """
+    if tasks is None:
+        return None
+    executors = [
+        a
+        for a in (agents or [])
+        if (a.get("status") or "active") == "active"
+        and str(a.get("permission_type") or "").strip().lower() == "executor"
+    ]
+    exec_n = len(executors)
+    if exec_n <= 0:
+        return None
+    is_verify = None
+    try:
+        from hiveweave.services.tasks.verify import is_verify_title as _ivt
+
+        is_verify = _ivt
+    except Exception:
+        is_verify = None
+    open_n = 0
+    for t in tasks or []:
+        if t.get("is_archived"):
+            continue
+        status = str(t.get("status") or "").strip().lower()
+        try:
+            if is_verify is not None and is_verify(t.get("title")):
+                continue  # VERIFY 是 QA 岗位，不是 executor 待派活
+        except Exception:
+            pass
+        assigned = bool(str(t.get("assignee_id") or "").strip())
+        if status == "blocked":
+            # P2-3：blocked 已有主 = 有主停靠位，不计可派活存量
+            if not assigned:
+                open_n += 1
+        elif status in ("created", "pending") and not assigned:
+            open_n += 1
+    if open_n >= exec_n:
+        return None
+    return (
+        f"⚠️ STAFFING ADVISORY（非阻塞提示，本次操作已生效）："
+        f"当前待派活任务 {open_n} < 在编执行者 {exec_n}，"
+        f"确认是否需要扩编（Reserve 待命成本）。"
+        f"优先给在编执行者派活或合并职责；确有新模块再做扩编，"
+        f"并在回报中说明新增人力的任务来源。"
+    )
+
+
 def validate_transfer(
     *,
     agents: list[dict[str, Any]],

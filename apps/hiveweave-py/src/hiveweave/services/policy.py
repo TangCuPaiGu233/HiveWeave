@@ -141,6 +141,15 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "start_dev_server": frozenset({Capability.BASH_SHELL}),
     "stop_dev_server": frozenset({Capability.BASH_SHELL}),
     "stop_processes_for_worktree": frozenset({Capability.BASH_SHELL}),
+    # E11 python_script 是执行通道：native 路径 create_subprocess_exec 直传
+    # argv、不经 command_guard —— 留在映射外即可用
+    # `script="subprocess.run(['icacls',...])"` 一行绕过 bash 硬门（42 轮
+    # 审计 P1）。与 bash 同门 BASH_SHELL：executor/中层 preset 均含
+    # BASH_SHELL 不受影响；HR 无 BASH_SHELL 被挡属合理收紧。
+    "python_script": frozenset({Capability.BASH_SHELL}),
+    # 交付冒烟预跑 = 按任务契约启动项目服务并跑探针脚本，同为执行通道，
+    # 归 TEST_RUN 门（QA/executor/中层均有 TEST_RUN；CEO/HR 无，合理收紧）。
+    "run_smoke": frozenset({Capability.TEST_RUN}),
     # 只读查注册表，不是 spawn —— 用 SOURCE_READ，避免 CEO/HR 看见工具却撞 BASH 门
     "lookup_dev_server": frozenset({Capability.SOURCE_READ}),
     "browse": frozenset({Capability.BROWSE, Capability.BROWSER_ACCEPTANCE}),

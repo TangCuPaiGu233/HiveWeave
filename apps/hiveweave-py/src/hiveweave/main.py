@@ -412,6 +412,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("tool_registry_audit_failed", error=str(e))
 
+    # 0b-2（42 轮报告 P1）：TOOL_CAPABILITY 全覆盖断言 —— 未映射工具在
+    #     tool_hard_deny 里默认放行（start_dev_server 08-13 实锤绕 CEO bash
+    #     硬门）。fail-loud：有缺失清单即启动失败，不许沉默放行。
+    from hiveweave.services.tool_capability_check import assert_all_tools_mapped
+
+    assert_all_tools_mapped()
+
     # 0b. 宿主环境探测（platform-issue-remediation Phase 0：T3.2/T3.3 前置）。
     #    启动时把「这台宿主能做什么」探成不可变结果；单条探测失败不炸启动
     #    （fail-closed 落在消费方 get_capability，不在这里）。

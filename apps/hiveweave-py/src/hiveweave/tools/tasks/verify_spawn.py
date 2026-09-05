@@ -932,6 +932,114 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
     return reattached
 
 
+async def _count_prior_stall_notices(
+    project_id: str, task_id: str, to_agent_id: str
+) -> int:
+    """该 (任务, 收件人) 已收到的 [VERIFY EXECUTOR STALL] 通知数（inbox 计数）。
+
+    升级判定的计数来源（42 轮报告）：查项目 DB inbox 表同收件人同任务的
+    STALL 通知行数。fail-open：查询失败按 0（不升级，维持旧行为）。
+    """
+    try:
+        from hiveweave.db import project as project_db
+
+        conn = await project_db.get_project_db_by_project_id(project_id)
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM inbox "
+            "WHERE to_agent_id = ? AND task_id = ? "
+            "AND message LIKE '%[VERIFY EXECUTOR STALL]%'",
+            [to_agent_id, task_id],
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row[0]) if row else 0
+    except Exception as e:  # noqa: BLE001
+        log.debug("verify_exec_stall_count_failed", error=str(e))
+        return 0
+
+
+def _pick_ceo_id(agents_by_id: dict[str, dict]) -> str:
+    """项目 CEO（root）id：只认显式 permission_type=ceo 或 role=ceo。
+
+    P2-2（审计）：不做「第一个无上级者」兜底 —— 组织数据异常（CEO 缺失/
+    花名错乱）时那会把 wake=1 强唤醒发给无关孤儿。找不到显式 CEO 返回
+    ""（放弃 CC，由调用方 log.warning），宁缺勿错发。
+    """
+    for a in agents_by_id.values():
+        if not a:
+            continue
+        pt = str(a.get("permission_type") or "").strip().lower()
+        role = str(a.get("role") or "").strip().lower()
+        if pt == "ceo" or role == "ceo":
+            return str(a.get("id") or "")
+    return ""
+
+
+async def _send_stall_notice(
+    inbox: Any,
+    *,
+    project_id: str,
+    task_id: str,
+    to_agent_id: str,
+    message: str,
+    agents_by_id: dict[str, dict],
+) -> None:
+    """发一条 [VERIFY EXECUTOR STALL] 通知；同一任务同一收件人第 2 次起升级。
+
+    42 轮实证：同一通知 20min 间隔 3 连发、42min 无行动，平台却只重复轰炸
+    原收件人。升级 = (a) 原通知追加一行「已升级抄送 CEO（第 N 次）」；
+    (b) CEO 收 inbox 副本（wake=1、trusted_platform、幂等键含序号防重）。
+    首次（N=1）行为与旧版逐字节一致。
+    """
+    prior = await _count_prior_stall_notices(project_id, task_id, to_agent_id)
+    n = prior + 1
+    if n >= 2:
+        message = f"{message}\n已升级抄送 CEO（第 {n} 次）。"
+    await inbox.send_message(
+        from_agent_id="system",
+        to_agent_id=to_agent_id,
+        message=message,
+        message_type="task",
+        priority="urgent",
+        task_id=task_id,
+        wake=True,
+    )
+    if n < 2:
+        return
+    ceo_id = _pick_ceo_id(agents_by_id)
+    if not ceo_id:
+        log.warning(
+            "verify_exec_stall_cc_skipped_no_ceo",
+            task_id=task_id,
+            note="no explicit ceo in org data; CC abandoned (P2-2)",
+        )
+        return
+    if ceo_id == to_agent_id:
+        return
+    try:
+        await inbox.send_message(
+            from_agent_id="system",
+            to_agent_id=ceo_id,
+            message=(
+                f"[VERIFY EXECUTOR STALL][CC] 第 {n} 次通知 "
+                f"{to_agent_id[:12]} 仍无行动（taskId={task_id}）。"
+                f"请介入（hire/reassign QA 或亲自推动）。原文：{message}"
+            ),
+            message_type="task",
+            priority="urgent",
+            task_id=task_id,
+            wake=True,
+            trusted_platform=True,
+            idempotency_key=f"verify-stall-cc|{task_id}|{to_agent_id}|{n}",
+        )
+    except Exception as e:  # noqa: BLE001 — 副本失败不影响主通知
+        log.warning(
+            "verify_exec_stall_cc_failed",
+            task_id=task_id,
+            error=str(e),
+        )
+
+
 async def maybe_reassign_stalled_verify(
     project_id: str,
     task: dict,
@@ -1029,8 +1137,10 @@ async def maybe_reassign_stalled_verify(
             )
             return False
         try:
-            await inbox.send_message(
-                from_agent_id="system",
+            await _send_stall_notice(
+                inbox,
+                project_id=project_id,
+                task_id=tid,
                 to_agent_id=dest,
                 message=(
                     f"[VERIFY EXECUTOR STALL] VERIFY '{title}' ({tid[:8]}) "
@@ -1040,10 +1150,7 @@ async def maybe_reassign_stalled_verify(
                     f"VERIFY is closed/cancelled — do not auto-approve. "
                     f"Hire or reassign a QA if needed."
                 ),
-                message_type="task",
-                priority="urgent",
-                task_id=tid,
-                wake=True,
+                agents_by_id=by_id,
             )
         except Exception as e:
             log.warning(
@@ -1089,14 +1196,13 @@ async def maybe_reassign_stalled_verify(
     )
     try:
         for rid in leaders:
-            await inbox.send_message(
-                from_agent_id="system",
+            await _send_stall_notice(
+                inbox,
+                project_id=project_id,
+                task_id=tid,
                 to_agent_id=rid,
                 message=body_leaders,
-                message_type="task",
-                priority="urgent",
-                task_id=tid,
-                wake=True,
+                agents_by_id=by_id,
             )
         await inbox.send_message(
             from_agent_id="system",

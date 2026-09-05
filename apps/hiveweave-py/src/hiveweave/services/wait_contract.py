@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -156,6 +157,108 @@ def default_ttl_ms(kind: str, agent_id: str | None = None) -> int:
             return max(60_000, int(base * factor))
         return base
     return int(settings.wait_ttl_external_ms)
+
+
+# ── timer wait 目标时刻语义（42 轮报告 P2-8）──────────────────────────
+# 旧行为：commit_turn(waiting_on=[{kind:timer, ref:<目标时刻>}]) 的
+# expires_at 一律 = created + wait_ttl_timer_ms(15min)。agent 设 4h 后的
+# 目标（如 15:00Z）会在 15min 时被 [WAIT_TIMEOUT] 假装「目标已到」唤醒
+# （实测 2 次虚假唤醒，提前 3.9h/12.6h）。新语义：
+#   A. 目标 ≤ created+TTL → expires_at = 目标时刻（按目标排队）；
+#   B. 目标 > created+TTL → 不再假装：expires_at 封顶 TTL，note 里打
+#      wakeup_reason=ttl_cap 标记，唤醒文案明说目标未到、请续等或改用
+#      schedule_alarm。
+# 解析不了的 ref（quota_reset / alarm-<uuid> 等平台内部 timer）维持旧 TTL。
+
+_WAKEUP_REASON_TAG = "[wakeup_reason="
+_TIME_ONLY_RE = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?Z?$")
+
+
+def parse_timer_target_ms(*values: Any) -> int | None:
+    """Best-effort parse a timer wait target (epoch s/ms, ISO-8601, or HH:MM[Z]).
+
+    语义与 tools.tasks.lifecycle._parse_wake_at_ms 对齐（epoch 秒自动升到
+    毫秒、naive ISO 按 UTC）；额外支持纯时刻 ``HH:MM(:SS)(Z)``（agent 常写
+    "15:00Z"）——取 UTC 今天该时刻，已过则取明天（下一个未来发生点）。
+    全部失败返回 None（调用方退回默认 TTL）。
+    """
+    import datetime as _dt
+
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, int):
+            v = value
+            if 0 < v < 10**11:
+                v *= 1000
+            return v if v > 0 else None
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            v = int(text)
+            if 0 < v < 10**11:
+                v *= 1000
+            return v if v > 0 else None
+        except ValueError:
+            pass
+        m = _TIME_ONLY_RE.match(text)
+        if m:
+            now_dt = _dt.datetime.now(_dt.timezone.utc)
+            cand = now_dt.replace(
+                hour=int(m.group(1)),
+                minute=int(m.group(2)),
+                second=int(m.group(3) or 0),
+                microsecond=0,
+            )
+            if cand <= now_dt - _dt.timedelta(minutes=1):
+                cand += _dt.timedelta(days=1)
+            return int(cand.timestamp() * 1000)
+        try:
+            dt = _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    return None
+
+
+def _iso_utc(target_ms: int) -> str:
+    import datetime as _dt
+
+    return (
+        _dt.datetime.fromtimestamp(target_ms / 1000, _dt.timezone.utc)
+        .isoformat()
+    )
+
+
+def _mark_wait_note(note: str | None, reason: str, target_ms: int) -> str:
+    """Append a machine-parseable wakeup_reason tag to a wait note."""
+    base = str(note or "").strip()
+    tag = f"{_WAKEUP_REASON_TAG}{reason} target={_iso_utc(target_ms)}]"
+    return f"{base} | {tag}" if base else tag
+
+
+def wait_wakeup_reason(wait: dict) -> str | None:
+    """Parse the ``[wakeup_reason=…]`` tag from a wait row's note (None 无标记)."""
+    note = str(wait.get("note") or "")
+    i = note.find(_WAKEUP_REASON_TAG)
+    if i < 0:
+        return None
+    rest = note[i + len(_WAKEUP_REASON_TAG):]
+    reason = rest.split("]", 1)[0].split(" ", 1)[0].strip()
+    return reason or None
+
+
+def wait_target_iso(wait: dict) -> str | None:
+    """Parse the target timestamp from a wakeup_reason tag (ISO-8601 UTC)."""
+    note = str(wait.get("note") or "")
+    i = note.find("target=")
+    if i < 0:
+        return None
+    rest = note[i + len("target="):]
+    return rest.split("]", 1)[0].split(" ", 1)[0].strip() or None
 
 
 async def _conn(project_id: str) -> aiosqlite.Connection:
@@ -427,7 +530,29 @@ class WaitContractService:
                         else ["task_transition"]
                     )
             elif exp is None:
-                exp = now + default_ttl_ms(kind, agent_id)
+                ttl_ms = default_ttl_ms(kind, agent_id)
+                target_ms = None
+                if str(kind).lower() == "timer":
+                    candidate = parse_timer_target_ms(ref, note)
+                    # P2-1（审计）：目标必须晚于本条 wait 的创建时刻才采信。
+                    # parse 对纯数字按 epoch —— ref 解析失败后回退 note 时，
+                    # note="30" 会解析成 1970（已过时刻）→ 立即假唤醒还标
+                    # target_reached（恰是要修的病）。过去时刻不采，退旧 TTL。
+                    if candidate is not None and candidate > now:
+                        target_ms = candidate
+                if target_ms is None:
+                    exp = now + ttl_ms
+                else:
+                    # P2-8：timer 有可解析目标时刻 —— ≤TTL 按目标排队；
+                    # >TTL 封顶 TTL 并打 ttl_cap 标记（唤醒文案区分，
+                    # 见 game_time._process_wait_contracts）。
+                    ttl_deadline = now + ttl_ms
+                    if target_ms <= ttl_deadline:
+                        exp = target_ms
+                        note = _mark_wait_note(note, "target_reached", target_ms)
+                    else:
+                        exp = ttl_deadline
+                        note = _mark_wait_note(note, "ttl_cap", target_ms)
             statements.append(
                 (
                     "INSERT INTO agent_waits "

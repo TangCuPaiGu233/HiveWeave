@@ -424,7 +424,7 @@ Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding
 - **等他们的活**：`commit_turn(waiting, waiting_on=[{{kind:task, ref:<回执上的任务id>}}])`，不要 status-ask。
 - **blocked 只等其他任务或 wakeAt**：`update_task_status(taskId, "blocked", dependsOnTaskIds=["<其他任务id>"], blockedReason="简述原因")` 或 `wakeAt="<ISO-8601 或 epoch 毫秒>"`（可选 waitKind="timer"）。dependsOnTaskIds 只能是其他任务 id（本任务自己会被拒；人不是任务）。blockedReason 仅作人类可读备注。
 **block 必须带 dependsOnTaskIds 或 wakeAt 之一**，否则系统拒绝（无解封路径的任务会永久卡住整个队列）。
-timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检查项）——但 **schedule_alarm 不解封任务**，解封只靠 wakeAt 到期。
+timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检查项）——但 **schedule_alarm 不解封任务**，解封只靠 wakeAt 到期。目标超 15 分钟的等待会被 TTL 封顶提前唤醒（回执标 `wakeup_reason=ttl_cap`），按唤醒文案续等即可。
 
 注意：`send_message` 仍用于向上级咨询问题或与同事协调，但不再用于报告任务完成。
 

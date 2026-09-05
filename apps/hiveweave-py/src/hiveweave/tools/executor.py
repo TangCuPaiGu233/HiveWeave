@@ -196,12 +196,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "goto always resets viewport to 1280×900. Mobile: "
             "viewport 390 844 AFTER goto, then screenshot. "
             "After screenshot, pixels inject into the next turn. "
-            "Do not assume screenshot.png at repo root or agent-browser/tmp. "
-            "CEO looking at the product does not stamp. "
             "Browser console/page errors are auto-captured after each "
             "command — appended as a [console] section in the result and "
             "counted in the browse_e2e attestation's console_errors; read "
             "it before blaming the DOM probe. "
+            "Do not assume screenshot.png at repo root or agent-browser/tmp. "
+            "CEO looking at the product does not stamp. "
             "Stays in YOUR workspace. Milestone VERIFY / full-site MAIN QA "
             "(and CEO looking at MAIN): use browse_main."
         ),
@@ -1374,21 +1374,6 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": [],
     },
-    "git_worktree_checkpoint": {
-        "description": (
-            "Stage all changes and create a checkpoint commit in the active "
-            "worktree. Receipt may include a WARNING about conflicts with "
-            "main — resolve early via `git rebase main` to avoid submit-time "
-            "rejection."
-        ),
-        "properties": {
-            "message": {"type": "string", "aliases": ["commitMessage", "commit_message", "summary"]},
-        },
-        "required": ["message"],
-    },
-    # — Network + file ops —
-    "webfetch": {
-        "description": (
     "git_worktree_sync": {
         "description": (
             "Sync MAIN's new commits into your worktree (MAIN → worktree). "
@@ -1413,6 +1398,21 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": [],
     },
+    "git_worktree_checkpoint": {
+        "description": (
+            "Stage all changes and create a checkpoint commit in the active "
+            "worktree. Receipt may include a WARNING about conflicts with "
+            "main — resolve early via `git rebase main` to avoid submit-time "
+            "rejection."
+        ),
+        "properties": {
+            "message": {"type": "string", "aliases": ["commitMessage", "commit_message", "summary"]},
+        },
+        "required": ["message"],
+    },
+    # — Network + file ops —
+    "webfetch": {
+        "description": (
             "Fetch a URL and extract readable text. Optional prompt to "
             "answer from the page. SSRF-blocked."
         ),
@@ -1664,6 +1664,17 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["verdict"]},
             "feedback": {"type": "string",
                 "aliases": ["comment", "reason"]},
+            "filesChanged": {
+                "type": "array",
+                "aliases": ["files_changed", "files"],
+                "description": (
+                    "Optional: paths YOU reviewed in the assignee worktree. "
+                    "When provided, substitutes for the submission's empty/"
+                    "wrong evidence.files_changed in the worktree proof gate "
+                    "(e.g. pure-doc tasks) — instead of bouncing the task to "
+                    "re-submit formality fields."
+                ),
+            },
         },
         "required": ["taskId", "decision"],
     },
@@ -1703,17 +1714,6 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             },
         },
         "required": ["files"],
-            "filesChanged": {
-                "type": "array",
-                "aliases": ["files_changed", "files"],
-                "description": (
-                    "Optional: paths YOU reviewed in the assignee worktree. "
-                    "When provided, substitutes for the submission's empty/"
-                    "wrong evidence.files_changed in the worktree proof gate "
-                    "(e.g. pure-doc tasks) — instead of bouncing the task to "
-                    "re-submit formality fields."
-                ),
-            },
     },
     "cancel_task": {
         "description": (
@@ -1761,6 +1761,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "waive_attestation": {
         "description": (
             "Waive the attestation gate for ONE task. Never all tasks. "
+            "Pass reasonKind: tool_failure (tool/upstream failure such as "
+            "audit LLM transient outage — you KEEP your approval right) or "
+            "quality (real quality exemption — waiving agent cannot later "
+            "approve unless small-team sole reviewer). "
             "Copy the entire taskId from the tool receipt; do not truncate. "
             "CEO: look at ledger.scope for that task first; may omit "
             "evidenceAttestationId after looking at that task. "
@@ -1782,6 +1786,16 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 ),
             },
             "reason": {"type": "string"},
+            "reasonKind": {
+                "type": "string",
+                "aliases": ["reason_kind", "kind"],
+                "description": (
+                    "quality (default, real quality exemption — you lose "
+                    "approval right) | tool_failure (tool/upstream failure "
+                    "such as audit LLM outage — you keep approval right). "
+                    "When unsure use quality."
+                ),
+            },
             "evidenceAttestationId": {
                 "type": "string",
                 "aliases": ["evidence_attestation_id"],
@@ -1810,10 +1824,6 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Read-only: busy/idle, disposition, unread_wake. Call this "
             "before claiming someone is busy or nagging a silence. "
             "Pass agentId (花名/short_id/UUID); omit to list the project."
-            "Pass reasonKind: tool_failure (tool/upstream failure such as "
-            "audit LLM transient outage — you KEEP your approval right) or "
-            "quality (real quality exemption — waiving agent cannot later "
-            "approve unless small-team sole reviewer). "
         ),
         "properties": {
             "agentId": {
@@ -1836,16 +1846,6 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "description": "花名, short_id, or UUID.",
             },
         },
-            "reasonKind": {
-                "type": "string",
-                "aliases": ["reason_kind", "kind"],
-                "description": (
-                    "quality (default, real quality exemption — you lose "
-                    "approval right) | tool_failure (tool/upstream failure "
-                    "such as audit LLM outage — you keep approval right). "
-                    "When unsure use quality."
-                ),
-            },
         "required": ["agentId"],
     },
     "get_platform_state": {
@@ -2022,6 +2022,16 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["task_id", "id"],
                 "description": "Optional. Omit to audit the current running task / whole worktree.",
             },
+            "appealNotes": {
+                "type": "string",
+                "aliases": ["appeal_notes", "appeal"],
+                "description": (
+                    "Optional author appeal: if some diff behavior is "
+                    "required by the task spec / acceptance criteria (quote "
+                    "the spec text and why). Reference only — the audit "
+                    "verifies independently and never auto-passes on appeal."
+                ),
+            },
         },
         "required": [],
     },
@@ -2082,16 +2092,6 @@ TOOL_PARAM_SCHEMAS["browse_main"] = {
 }
 TOOL_PARAM_SCHEMAS["game_run_case_main"] = {
     **TOOL_PARAM_SCHEMAS["game_run_case"],
-            "appealNotes": {
-                "type": "string",
-                "aliases": ["appeal_notes", "appeal"],
-                "description": (
-                    "Optional author appeal: if some diff behavior is "
-                    "required by the task spec / acceptance criteria (quote "
-                    "the spec text and why). Reference only — the audit "
-                    "verifies independently and never auto-passes on appeal."
-                ),
-            },
     "properties": dict(TOOL_PARAM_SCHEMAS["game_run_case"].get("properties") or {}),
     "description": (
         "Same as game_run_case, but Chromium cwd is the PROJECT ROOT. Use "

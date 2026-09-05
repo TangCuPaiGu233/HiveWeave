@@ -659,6 +659,9 @@ async def lifespan(app: FastAPI):
             async def _acl_backfill() -> None:
                 try:
                     from hiveweave.db import project as project_db
+                    from hiveweave.services.acl_sandbox.temppatch import (
+                        probe_private_temp,
+                    )
 
                     projs = await meta_db.query(
                         "SELECT id, workspace_path FROM projects WHERE 1=1"
@@ -666,9 +669,6 @@ async def lifespan(app: FastAPI):
                     backfilled = 0
                     for p in projs:
                         root = p["workspace_path"]
-                    from hiveweave.services.acl_sandbox.temppatch import (
-                        probe_private_temp,
-                    )
                         if not root or not (Path(root) / ".git").exists():
                             continue
                         try:
@@ -696,13 +696,6 @@ async def lifespan(app: FastAPI):
                                         project_workspace_path=root,
                                         agent_id=a["short_id"] or "system",
                                     )
-                            backfilled += 1
-                        except Exception as e:
-                            log.warning(
-                                "acl_sandbox_backfill_failed",
-                                project_id=p["id"], error=str(e),
-                            )
-                    log.info("acl_sandbox_backfill_done", projects=backfilled)
                                     # P0（2026-09-05）：启动回填自检（fail-soft）
                                     # —— 私有锚点写+删探针 + 死岛修复。
                                     await probe_private_temp(
@@ -710,6 +703,13 @@ async def lifespan(app: FastAPI):
                                         agent_id=a["short_id"] or "system",
                                         project_workspace_path=root,
                                     )
+                            backfilled += 1
+                        except Exception as e:
+                            log.warning(
+                                "acl_sandbox_backfill_failed",
+                                project_id=p["id"], error=str(e),
+                            )
+                    log.info("acl_sandbox_backfill_done", projects=backfilled)
                 except Exception as e:
                     log.warning("acl_sandbox_backfill_error", error=str(e))
 
@@ -833,6 +833,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("health_supervisor_start_failed", error=str(e))
 
+    # 6b. 审计 epic P1-4：审计上游暂态失败的后台重试循环（llm_failed 入队，
+    # 60s 扫到期 pending，成功/作废/耗尽均收件箱回填通知）。
+    try:
+        from hiveweave.services.audit_retry import audit_retry_loop
+        audit_retry_loop.start()
+    except Exception as e:
+        log.warning("audit_retry_loop_start_failed", error=str(e))
+
     # Security: 启动序列末尾检测不安全配置（空 API key + 非 loopback host）。
     # 仅打 WARNING 日志，不阻止启动 — 让运维看到醒目提示后自行加固。
     try:
@@ -850,14 +858,6 @@ async def lifespan(app: FastAPI):
 
         _asyncio.create_task(_task())
 
-    # 6b. 审计 epic P1-4：审计上游暂态失败的后台重试循环（llm_failed 入队，
-    # 60s 扫到期 pending，成功/作废/耗尽均收件箱回填通知）。
-    try:
-        from hiveweave.services.audit_retry import audit_retry_loop
-        audit_retry_loop.start()
-    except Exception as e:
-        log.warning("audit_retry_loop_start_failed", error=str(e))
-
     _spawn_legacy_stash_scan()
     log.info("app_started")
 
@@ -865,6 +865,13 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ─────────────────────────────────────────────
     log.info("app_stopping")
+
+    # Stop audit retry loop first (cheap, no in-flight LLM dependency)
+    try:
+        from hiveweave.services.audit_retry import audit_retry_loop
+        audit_retry_loop.stop()
+    except Exception:
+        pass
 
     # Stop health supervisor first (before game_time)
     try:
@@ -883,13 +890,6 @@ async def lifespan(app: FastAPI):
     log.info("game_time_stopped")
 
     # Reap native off-turn jobs before stopping agents so completion
-    # Stop audit retry loop first (cheap, no in-flight LLM dependency)
-    try:
-        from hiveweave.services.audit_retry import audit_retry_loop
-        audit_retry_loop.stop()
-    except Exception:
-        pass
-
     # cannot trigger_subordinate and revive a stopped agent.
     try:
         from hiveweave.services.offturn import reap_all_offturn_jobs

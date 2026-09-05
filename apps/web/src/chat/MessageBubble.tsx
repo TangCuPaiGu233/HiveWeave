@@ -232,6 +232,7 @@ function RoundBoundaryRow({ round }: { round?: number }) {
   );
 }
 
+/** 来源徽章 —— 气泡的核心职责：一眼看出这条消息来自谁。 */
 function SourceBadge({ source }: { source: "agent" | "system" | "watchdog" }) {
   if (source === "watchdog") {
     return (
@@ -463,11 +464,10 @@ function MessageBubbleInner({
                 // 文本流，永远独立成行。
                 return <RoundBoundaryRow key={`round-${seg.round ?? i}`} round={seg.round} />;
               }
-                return <ThinkingBlock key={`think-${i}`} content={seg.content} />;
               if (seg.type === "thinking" && seg.content) {
+                return <ThinkingBlock key={`think-${i}`} content={seg.content} />;
               }
               if (seg.type === "text" && seg.content) {
-                return (
                 // P1 安全门（审计 2026-09-05）：markdown 仅限 assistant text 段。
                 // 当前没有 user 消息携带 segments 的路径，但未来任何路径挂上了，
                 // 此门兜住「用户输入被静默按 markdown 语义渲染」——用户文本按
@@ -477,6 +477,7 @@ function MessageBubbleInner({
                   // 头注释）。段落节奏由 .hw-md p{margin:.25rem 0} 保持原 my-1 观感。
                   return <MarkdownText key={`text-${i}`} content={seg.content} />;
                 }
+                return (
                   <p key={`text-${i}`} className="whitespace-pre-wrap my-1">
                     {seg.content}
                   </p>

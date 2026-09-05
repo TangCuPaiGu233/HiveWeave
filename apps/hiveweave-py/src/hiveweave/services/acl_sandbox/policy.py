@@ -19,6 +19,7 @@ from hiveweave.services.acl_sandbox.sid import (
     cache_sid,
     extra_sid,
     git_sid,
+    shared_sid,
     temp_sid,
     venv_sid,
     worktree_sid,
@@ -31,6 +32,9 @@ CACHE_REL = ".hiveweave-cache"
 # 可写（GRANT_MASK）：agent 经 uv pip 往里装包 = 与写工作区代码同等信任
 # （DSH 同构：workspaceRoot 全可写）。
 VENV_REL = ".venv"
+# 项目共享契约区（git 跟踪、跨 agent 可见可写）。落在 `.hiveweave` PROTECTED
+# 区内侧，能力 ACE 必须显式落在 shared 子树（s3c09 git×ACL 死锁修复）。
+SHARED_REL = ".hiveweave/shared"
 
 # §5.7 六入口 → 边界语义（全部以工具传入的 workspace_path 为边界源）
 ENTRY_BOUNDARY: dict[str, str] = {
@@ -55,8 +59,10 @@ class SandboxPolicy:
     cache_dir: str                          # 项目级共享缓存
     venv_dir: str                           # 项目 .venv（依赖环境，可写）
     venv_sid_str: str
+    shared_dir: str                         # 边界内 `.hiveweave/shared`（授予目标，可能不存在）
     extra_dirs: list[str] = field(default_factory=list)   # §5.5b②：附加可写目录（realpath）
     extra_sids: list[str] = field(default_factory=list)
+    shared_sid_str: str | None = None       # worktree 边界才有值（项目级派生，非 per-agent）
 
 
 def resolve_temp_dir(workspace_path: str, agent_id: str) -> str:
@@ -91,6 +97,10 @@ def build_write_sids(
     - boundary SID：空前缀，派生自边界根（worktree 或项目根），路径即边界；
     - cache\\0 / git\\0 / venv\\0：**派生自项目根**（§4.8/§8）—— 同项目全 agent 共享
       同一 git/cache/venv 能力，跨项目 SID 不同（域前缀 + 路径）；
+    - shared\\0：**派生自项目根且仅 worktree 边界携带**（boundary != project）——
+      shared 是 git 跟踪的跨 agent 契约区，各 worktree 内 git rebase/checkout
+      要写删 `<wt>/.hiveweave/shared/*`；CEO/HR/bash_main 项目根边界不携带，
+      HR/只读授予面不变（s3c09 git×ACL 死锁修复，2026-09-05）；
     - temp\\0 / extra\\0 各自域分离。跨项目同 SID 撞车需全 60-bit 碰撞（~2⁻⁵⁴）。
     """
     boundary = os.path.realpath(boundary_root)
@@ -101,6 +111,8 @@ def build_write_sids(
         git_sid(project),
         temp_sid_str,
     ]
+    if boundary != project:
+        sids.append(shared_sid(project))
     if venv_sid_str:
         sids.append(venv_sid_str)
     for d in extra_dirs:
@@ -130,6 +142,9 @@ def resolve_policy(
     extra_paths = [os.path.realpath(d) for d in extra_dirs]
     venv_dir = resolve_venv_dir(project)
     venv_sid_str = venv_sid(project)
+    # shared 授予面 = worktree 边界（executor + builder coordinator）：
+    # CEO/HR/bash_main 项目根边界（root == project）不授予不携带，行为不变。
+    is_worktree_boundary = root != project
     return SandboxPolicy(
         boundary_root=root,
         project_root=project,
@@ -141,6 +156,8 @@ def resolve_policy(
         cache_dir=resolve_cache_dir(project),
         venv_dir=venv_dir,
         venv_sid_str=venv_sid_str,
+        shared_dir=str(Path(root) / SHARED_REL),
         extra_dirs=extra_paths,
         extra_sids=[extra_sid(d) for d in extra_paths],
+        shared_sid_str=shared_sid(project) if is_worktree_boundary else None,
     )

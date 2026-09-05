@@ -206,3 +206,12 @@ tasks/_v45_snap/
 tasks/_s310_app.tar.gz
 tasks/_standalone_check.mjs
 tasks/commit-msg-*.txt
+
+# tasks 一次性验证/核查脚本与快照绑定档案（跑完即弃；复用管线 _desk_*/_s310_* 除外）
+tasks/_v45_*
+tasks/_p44_*
+tasks/_ws_instruct*.py
+tasks/check_recovery.py
+tasks/_inline_module_check.mjs
+tasks/_served_*
+tasks/create-*-payload.json

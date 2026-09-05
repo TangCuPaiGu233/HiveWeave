@@ -659,6 +659,9 @@ async def lifespan(app: FastAPI):
                     backfilled = 0
                     for p in projs:
                         root = p["workspace_path"]
+                    from hiveweave.services.acl_sandbox.temppatch import (
+                        probe_private_temp,
+                    )
                         if not root or not (Path(root) / ".git").exists():
                             continue
                         try:
@@ -693,6 +696,13 @@ async def lifespan(app: FastAPI):
                                 project_id=p["id"], error=str(e),
                             )
                     log.info("acl_sandbox_backfill_done", projects=backfilled)
+                                    # P0（2026-09-05）：启动回填自检（fail-soft）
+                                    # —— 私有锚点写+删探针 + 死岛修复。
+                                    await probe_private_temp(
+                                        workspace_path=wt,
+                                        agent_id=a["short_id"] or "system",
+                                        project_workspace_path=root,
+                                    )
                 except Exception as e:
                     log.warning("acl_sandbox_backfill_error", error=str(e))
 

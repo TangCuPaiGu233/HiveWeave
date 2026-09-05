@@ -82,17 +82,23 @@ _CWD_FAILURE_HINT = (
 # B-1 P1-1 沙箱可写锚点（M1 死因的守补位）：受限 shell 的 $env:TEMP 已被沙箱
 # 改写到工作区内 **agent 私有可写** 目录 .hiveweave/sandbox-temp/<agent_id>。
 # 此文案注入 bash/pwsh 工具 description（系统提示），让代理知道有可写私有
-# TEMP，并指向 pytest --basetemp / -p no:cacheprovider 避开共享缓存权限墙。
+# TEMP。P0（2026-09-05）：pytest tmp_path/--basetemp 在锚点下**原生可用**
+# （平台注入 shim 修掉 CPython>=3.12 的 mode=0o700 → OWNER_RIGHTS 死岛，
+# 见 acl_sandbox/temppatch.py），话术从「手动指 --basetemp」改为「共享缓存
+# 墙才是要绕的」+ 失败自救路径（fresh 子目录 + 上报）。
 SANDBOX_TEMP_GUIDE = (
     "\n\n[B-1 Sandbox anchor] On Windows the ACL sandbox redirects $env:TEMP / "
     "$env:TMP to YOUR private writable dir: `<workspace>/.hiveweave/"
     "sandbox-temp/<your_agent_id>`. Use it for scratch files, temp caches and "
-    "pytest watcher/node temp. When pytest/vitest/npm runs hit "
-    "\"Access is denied\"/\"Permission denied\" on a shared cache "
-    "(.pytest_cache/__pycache__/.cache), point the runner at your private TEMP "
-    "and disable the shared cache, e.g. pytest "
-    "\"--basetemp=$env:TEMP/node-<name>\" -p no:cacheprovider "
-    "or vitest --cache-dir=$env:TEMP/vitest-cache."
+    "runner temp; pytest tmp_path/--basetemp under this dir works natively. "
+    "When pytest/vitest/npm runs hit \"Access is denied\"/\"Permission denied\" "
+    "on a SHARED cache in the workspace (.pytest_cache/__pycache__/"
+    "node_modules/.cache), disable the shared cache instead: pytest "
+    "-p no:cacheprovider, or vitest --cache-dir=$env:TEMP/vitest-cache. If "
+    "writes under your own TEMP ever fail with Access denied, point the "
+    "runner at a FRESH subdir of $env:TEMP (e.g. pytest "
+    "\"--basetemp=$env:TEMP/pt-<run>\") and report the failure — never retry "
+    "the same reused temp directory."
 )
 
 # B-1 P1-1 ②：测试类命令 + 权限类失败 → 追加"可写锚点"hint（bash.py 失败输出增强）。
@@ -567,8 +573,9 @@ def _maybe_append_test_anchor_hint(command: str, error_msg: str) -> str:
     """B-1 P1-1 ②：测试类命令 + 权限类失败 → 追加一次"可写锚点"hint。
 
     命中（是测试运行器命令 && 失败输出带权限/拒绝类特征）才追加；未命中
-    原样返回（fail-open，零扰动）。提示沙箱私有 TEMP 与 --basetemp /
-    no:cacheprovider，指向 M1 权限墙的正确出路。
+    原样返回（fail-open，零扰动）。P0（2026-09-05）后锚点下 pytest tmp_path
+    原生可用，hint 聚焦两类残余墙：复用旧 temp 目录（fresh 子目录自救）与
+    工作区共享缓存（no:cacheprovider / cache-dir）。
     """
     if not command or not error_msg:
         return error_msg
@@ -577,12 +584,14 @@ def _maybe_append_test_anchor_hint(command: str, error_msg: str) -> str:
     if not _ACCESS_DENIED_RE.search(error_msg):
         return error_msg
     return error_msg + (
-        "\n\n[Sandbox anchor hint] This test command likely hit the shared-cache "
-        "permission wall: on Windows your $env:TEMP points to a private writable "
-        "dir `<workspace>/.hiveweave/sandbox-temp/<agent_id>`. Point the runner "
-        "there and disable the shared cache: pytest "
-        "\"--basetemp=$env:TEMP/node-test\" -p no:cacheprovider, or "
-        "vitest --cache-dir=$env:TEMP/vitest-cache."
+        "\n\n[Sandbox anchor hint] This test command likely hit a permission "
+        "wall. Your $env:TEMP points to a private writable dir "
+        "`<workspace>/.hiveweave/sandbox-temp/<agent_id>` — pytest tmp_path "
+        "works there natively; if a REUSED temp dir still denies access, use "
+        "a fresh subdir: pytest \"--basetemp=$env:TEMP/pt-<run>\". For shared "
+        "caches in the workspace (.pytest_cache/__pycache__/.cache), disable "
+        "them instead: -p no:cacheprovider, or vitest "
+        "--cache-dir=$env:TEMP/vitest-cache."
     )
 
 

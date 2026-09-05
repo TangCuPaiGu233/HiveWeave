@@ -681,6 +681,18 @@ yarn.lock merge=union
                         project_workspace_path=project_root,
                         agent_id=short_id,
                     )
+                    # P0（2026-09-05）开工自检（fail-soft）：私有 TEMP 锚点
+                    # 写+删探针 + OWNER_RIGHTS 死岛修复；失败只告警不阻断
+                    # 建树（见 acl_sandbox/temppatch.probe_private_temp）。
+                    from hiveweave.services.acl_sandbox.temppatch import (
+                        probe_private_temp,
+                    )
+
+                    await probe_private_temp(
+                        workspace_path=worktree_path,
+                        agent_id=short_id,
+                        project_workspace_path=project_root,
+                    )
                 except Exception as e:  # 铺授失败只告警，verify-then-skip 兜底
                     log.warning(
                         "acl_sandbox_worktree_grant_failed",

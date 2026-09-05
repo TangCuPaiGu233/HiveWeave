@@ -15,18 +15,24 @@ from __future__ import annotations
 
 import asyncio
 import os
+import stat
 import sys
 import threading
 from collections import deque
 from pathlib import Path
 from typing import Any
 
+import structlog
+
 from hiveweave.config import settings
-from hiveweave.services.acl_sandbox import telemetry
+from hiveweave.services.acl_sandbox import telemetry, temppatch
 from hiveweave.services.acl_sandbox.errors import SandboxUnavailableError
 from hiveweave.services.acl_sandbox.grant import (
     CACHE_MASK,
+    FILE_ALL_ACCESS,
     GRANT_MASK,
+    WRITE_DAC,
+    WRITE_OWNER,
     WriteGrant,
 )
 from hiveweave.services.acl_sandbox.policy import resolve_policy
@@ -34,6 +40,8 @@ from hiveweave.services.acl_sandbox.sid import cache_sid, extra_sid, git_sid, wo
 from hiveweave.services.acl_sandbox.spawn import ConfinedRunner
 from hiveweave.services.acl_sandbox.token import RestrictedTokenFactory
 from hiveweave.util.safe_env import build_child_env
+
+log = structlog.get_logger(__name__)
 
 # 拒绝方言（§5.6）：stderr 命中且非零退出 → 追加沙箱提示（限频）
 REJECTION_DIALECT = (
@@ -109,6 +117,137 @@ def _collect_shared_cache_dirs(boundary: str) -> list[str]:
     return found
 
 
+# ── s3c09 git×ACL 死锁修复：shared 子树补授 walker（水位 + verify-then-skip）──
+# shared 根的 OI/CI 授予经 SetNamedSecurityInfo 急切传播覆盖存量非 PROTECTED
+# 子树；PROTECTED 死岛（如 CPython>=3.12 mkdir(mode!=0o777) 产物）接不到传播，
+# 由本 walker 补授。同 temppatch 哲学：浅层受控 + 节点封顶 + 进程内水位。
+# 越界防线：junction/symlink/reparse point 一律跳过——跟随授予会把 OI/CI
+# 可继承 ACE 落到边界外目标子树（mklink /J 无需特权，持久落盘即全员越界）。
+# 判据 = FILE_ATTRIBUTE_REPARSE_POINT 属性（实测 py3.13 junction 的
+# DirEntry.is_symlink() 返回 False、is_dir(follow=False) 返回 True，
+# is_symlink 只能兜底 symlink）；shared 根自身的 reparse 检查在授予点
+# （_ensure_standing_grants，_is_reparse_point）。
+_SHARED_WALK_MAX_DEPTH = 6
+_SHARED_WALK_MAX_NODES = 2048
+# 死岛 normal-pass 补授掩码：FILE_ALL 去 WRITE_DAC/WRITE_OWNER（M7 红线不变）。
+# 孤岛 DACL 只有 OWNER_RIGHTS（受限令牌不消费该 SID），须补**真实主体** ACE
+# 恢复 normal-pass 的 READ_CONTROL / FILE_TRAVERSE / 读位 —— 实测 write-open
+# 的 READ_CONTROL 走 normal pass，只补能力 SID 写位开不了门（dbg 实证钉死）。
+_NORMAL_PASS_MASK = FILE_ALL_ACCESS & ~(WRITE_DAC | WRITE_OWNER)  # 0x1301FF
+_shared_repaired: set[str] = set()
+_shared_repaired_guard = threading.Lock()
+
+
+def _is_reparse_point(path: str) -> bool:
+    """路径是否 junction/symlink（reparse point）。os.stat follow=False 纯 stdlib。"""
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _repair_shared_islands(
+    shared_dir: str, shared_sid_str: str, user_sid: str | None
+) -> tuple[int, int, bool]:
+    """shared 子树死岛节点补授（目录与**文件**都扫，junction/symlink 跳过）。
+
+    返回 ``(repaired, failed, truncated)``：
+    - repaired —— 实际补授次数；
+    - failed —— 单节点授予/扫描失败数（fail-soft，不中断遍历）；
+    - truncated —— 节点封顶截断（未扫完整棵子树）。
+
+    每节点两 pass 对齐令牌评估（temppatch 同款双 SID 哲学）：
+    - restricting pass：缺 ``shared_sid`` GRANT_MASK ACE → 补（写/删位）；
+    - normal pass：节点无任何真实主体写 ACE（OWNER_RIGHTS-only 死岛形态）
+      → 补当前用户 ``_NORMAL_PASS_MASK``（只动死岛，健康树 verify 跳过 ——
+      不给正常节点重复加 ACE，授予面不扩大）。
+    """
+    repaired = 0
+    failed = 0
+    truncated = False
+    visited = 0
+    stack: list[tuple[str, int]] = [(shared_dir, 0)]
+    while stack:
+        if visited >= _SHARED_WALK_MAX_NODES:
+            truncated = True
+            break
+        d, depth = stack.pop()
+        visited += 1
+        try:
+            if not WriteGrant.ace_present(d, shared_sid_str, GRANT_MASK):
+                WriteGrant.grant_standing(d, shared_sid_str, GRANT_MASK)
+                repaired += 1
+            if user_sid and not WriteGrant.has_subject_write_ace(d):
+                WriteGrant.grant_standing(d, user_sid, _NORMAL_PASS_MASK)
+                repaired += 1
+        except Exception:  # noqa: BLE001 —— 单节点失败不中断遍历
+            failed += 1
+            continue
+        try:
+            children = list(os.scandir(d))
+        except OSError:
+            failed += 1
+            continue
+        for c in children:
+            if visited >= _SHARED_WALK_MAX_NODES:
+                truncated = True
+                break
+            try:
+                # junction/symlink/reparse 一律不跟随、不授予（越界防线）。
+                # 实测 py3.13：junction 的 DirEntry.is_symlink() 返回 False、
+                # is_dir(follow=False) 返回 True —— is_symlink 只是兜底，
+                # 必须以 FILE_ATTRIBUTE_REPARSE_POINT 属性为准（junction 与
+                # symlink 均带该位），否则会入栈跟出去给边界外目标落 ACE。
+                c_st = c.stat(follow_symlinks=False)
+                if c.is_symlink() or (
+                        getattr(c_st, "st_file_attributes", 0)
+                        & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                    continue
+                is_dir = stat.S_ISDIR(c_st.st_mode)
+            except OSError:
+                failed += 1
+                continue
+            if is_dir:
+                if depth < _SHARED_WALK_MAX_DEPTH:
+                    stack.append((c.path, depth + 1))
+                continue
+            visited += 1
+            try:
+                if not WriteGrant.ace_present(c.path, shared_sid_str, GRANT_MASK):
+                    WriteGrant.grant_standing(c.path, shared_sid_str, GRANT_MASK)
+                    repaired += 1
+                if user_sid and not WriteGrant.has_subject_write_ace(c.path):
+                    WriteGrant.grant_standing(c.path, user_sid, _NORMAL_PASS_MASK)
+                    repaired += 1
+            except Exception:  # noqa: BLE001
+                failed += 1
+                continue
+    return repaired, failed, truncated
+
+
+def _repair_shared_islands_once(
+    shared_dir: str, shared_sid_str: str, user_sid: str | None
+) -> tuple[int, int, bool]:
+    """水位版 walker：同进程同 shared 根只全跑一次（稳态零扫描）。
+
+    水位键 = normcase(realpath(shared_dir))。**只有全清（failed==0 且未截断）
+    才落水位**——失败/截断的子树下一命令 verify-then-skip 重扫；已落水位的
+    根命中水位直接返回 ``(0, 0, False)``。
+    """
+    key = os.path.normcase(os.path.realpath(shared_dir))
+    with _shared_repaired_guard:
+        if key in _shared_repaired:
+            return 0, 0, False
+    repaired, failed, truncated = _repair_shared_islands(
+        shared_dir, shared_sid_str, user_sid
+    )
+    if failed == 0 and not truncated:
+        with _shared_repaired_guard:
+            _shared_repaired.add(key)
+    return repaired, failed, truncated
+
+
 def is_rejection(stderr: str, exit_code: Any) -> bool:
     """拒绝方言命中判定：非零退出且 stderr 含拒绝特征。"""
     if not exit_code or exit_code == 0:
@@ -146,6 +285,18 @@ def _build_sandbox_env(
     env["TMP"] = temp_dir
     for var, sub in _CACHE_ENV_OVERRIDES.items():
         env[var] = os.path.join(temp_dir, "cache", sub)
+    # P0（2026-09-05，temppatch.py）：私有 TEMP × pytest tmp_path 死锁 ——
+    # CPython>=3.12 Windows 把 mkdir(mode=0o700) 落成 PROTECTED OWNER_RIGHTS
+    # DACL，pytest 整条 tmp 链都是该形态，在私有锚点下造死岛（实测
+    # [WinError 5]）。sandbox-temp 根的 sitecustomize shim 把受限子进程的
+    # os.mkdir 中和回 0o777（新目录继承父 DACL —— 仍在「受限令牌 + 能力
+    # SID」模型内，见 temppatch.SHIM_SOURCE）。目录前插既有 PYTHONPATH
+    # （白名单透传值不丢）；shim 缺席时注入无害（site 静默忽略）。
+    shim_dir = temppatch.shim_dir_for_temp_dir(temp_dir)
+    existing_pp = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{shim_dir}{os.pathsep}{existing_pp}" if existing_pp else shim_dir
+    )
     return env
 
 
@@ -319,6 +470,78 @@ async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
         os.makedirs(venv_dir, exist_ok=True)
     await _grant_if_missing(venv_dir, policy.venv_sid_str, GRANT_MASK, agrant)
 
+    # s3c09 git×ACL 死锁修复（42 轮实证，2026-09-05）：`.hiveweave/shared`
+    # 是 git **跟踪** 的跨 agent 契约区（info/exclude 反选维持跟踪），worktree
+    # 内 git rebase/checkout/unlink 要写删 `<wt>/.hiveweave/shared/*`；上方
+    # break_inheritance 已把 `.hiveweave` 裁成 PROTECTED（先裁剪后根 grant 的
+    # 既有不变量），shared 子树对受限令牌双 pass 全落空 —— 实证
+    # `unable to create file .hiveweave/shared/m2-interface.md` + unlink
+    # warning。对边界 shared 子树补授**项目级** shared_sid（GRANT_MASK 同
+    # worktree/git 授法；OI/CI 继承 → 子树内新建文件自动带 ACE）。
+    # 授予面 = worktree 边界（executor + builder coordinator，policy 层
+    # boundary != project 判定）；CEO/HR/bash_main 项目根边界 shared_sid_str
+    # 为 None，token 也不携带 —— HR/只读授予面不变。目录不存在（老项目/尚未
+    # 物化）跳过，下一轮 standing grants（每命令 verify-then-skip）重试。
+    # 授失败只告警不阻断 agent 启动（与探针同哲学），下轮重试。
+    if policy.shared_sid_str:
+        try:
+            if os.path.isdir(policy.shared_dir):
+                # P0（audit 2026-09-05）：shared 根本身是 junction/symlink
+                #（如被跟踪的 symlink 经 checkout 物化）→ 整棵跳过 —— 对
+                # reparse 根授予 = 给边界外目标子树落持久可继承 ACE。
+                # GetFileAttributes 含 FILE_ATTRIBUTE_REPARSE_POINT 即拦。
+                if await asyncio.to_thread(_is_reparse_point, policy.shared_dir):
+                    log.warning(
+                        "acl_sandbox.shared_dir_reparse_skip",
+                        shared_dir=policy.shared_dir,
+                        hint="shared 根是 junction/symlink，拒绝授予与子树扫描",
+                    )
+                else:
+                    try:
+                        await _grant_if_missing(
+                            policy.shared_dir, policy.shared_sid_str,
+                            GRANT_MASK, agrant,
+                        )
+                    except SandboxUnavailableError as e:
+                        log.warning(
+                            "acl_sandbox.shared_grant_failed",
+                            shared_dir=policy.shared_dir, error=str(e),
+                        )
+                    else:
+                        # 存量升级：PROTECTED 死岛没接到自动传播 —— 水位 walker
+                        # verify-then-skip 补授（能力 SID + 死岛 normal-pass 用户
+                        # SID，双 pass 对齐令牌评估；junction/symlink 跳过）。
+                        # failed/truncated>0 时不落水位 —— 下一命令重扫。
+                        user_sid = await asyncio.to_thread(
+                            temppatch.current_user_sid
+                        )
+                        repaired, failed, truncated = await asyncio.to_thread(
+                            _repair_shared_islands_once,
+                            policy.shared_dir, policy.shared_sid_str, user_sid,
+                        )
+                        if repaired:
+                            log.info(
+                                "acl_sandbox.shared_islands_repaired",
+                                shared_dir=policy.shared_dir,
+                                repaired=repaired,
+                            )
+                        if failed or truncated:
+                            log.warning(
+                                "acl_sandbox.shared_walk_incomplete",
+                                shared_dir=policy.shared_dir,
+                                failed=failed, truncated=truncated,
+                            )
+            else:
+                log.debug(
+                    "acl_sandbox.shared_dir_absent_skip",
+                    shared_dir=policy.shared_dir,
+                )
+        except Exception as e:  # noqa: BLE001 —— shared 补授绝不阻断 spawn
+            log.warning(
+                "acl_sandbox.shared_grant_failed",
+                shared_dir=policy.shared_dir, error=str(e),
+            )
+
     # §P1-1 工作区共享缓存目录补授 AU 写（M1 测试类命令 EPERM 根因之一）：
     # pytest/vitest/node 会写 .pytest_cache/__pycache__/node_modules/.cache 等，
     # 受限进程自建时是 OWNER_RIGHTS-only 且不继承父 ACE → 多 worktree 写同一
@@ -350,6 +573,30 @@ async def _ensure_temp(policy, agrant: _AsyncGrant) -> None:
         os.makedirs(temp_dir, exist_ok=True)
     if not await agrant.ace_present_async(temp_dir, policy.temp_sid, GRANT_MASK):
         await agrant.grant_standing_async(temp_dir, policy.temp_sid, GRANT_MASK)
+    # P0（2026-09-05）：sitecustomize shim（幂等）+ 存量 OWNER_RIGHTS 死岛
+    # 浅层补授（上一轮遗留的 pytest-of-* 等）。fail-soft —— 任一失败只告警，
+    # 回退既有行为，下一命令 verify-then-skip 重试。P2（audit）：walker 走
+    # 进程内 per-anchor 水位（同锚点只全跑一次，稳态不再每命令扫锚点子树；
+    # probe_private_temp 路径不受水位限制仍全跑）。
+    try:
+        shim_dir = await asyncio.to_thread(
+            temppatch.ensure_sitecustomize_shim,
+            temppatch.shim_dir_for_temp_dir(temp_dir),
+        )
+        user_sid = await asyncio.to_thread(temppatch.current_user_sid)
+        repaired = await asyncio.to_thread(
+            temppatch.repair_temp_islands_once, temp_dir, policy.temp_sid,
+            user_sid,
+        )
+        if repaired:
+            log.info(
+                "acl_sandbox.temp_islands_repaired",
+                temp_dir=temp_dir, repaired=repaired, shim_dir=shim_dir,
+            )
+    except Exception as e:  # noqa: BLE001 —— 死锁修复是增量，绝不阻断 spawn
+        log.warning(
+            "acl_sandbox.temp_patch_failed", temp_dir=temp_dir, error=str(e)
+        )
 
 
 def _maybe_append_rejection_hint(agent_id: str, boundary: str, result: dict) -> dict:

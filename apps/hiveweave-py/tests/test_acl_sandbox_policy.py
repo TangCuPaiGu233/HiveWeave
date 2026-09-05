@@ -7,6 +7,7 @@ import pytest
 from hiveweave.services.acl_sandbox.policy import (
     ENTRY_BOUNDARY,
     SANDBOX_TEMP_REL,
+    SHARED_REL,
     build_write_sids,
     resolve_policy,
     resolve_temp_dir,
@@ -16,6 +17,7 @@ from hiveweave.services.acl_sandbox.sid import (
     cache_sid,
     extra_sid,
     git_sid,
+    shared_sid,
     temp_sid,
     worktree_sid,
 )
@@ -34,7 +36,11 @@ def test_entry_boundary_covers_all_six_rows() -> None:
 
 
 def test_build_write_sids_structure(tmp_path) -> None:
-    """组装顺序/构成：boundary + cache(项目根) + git(项目根) + temp（§3 一览）。"""
+    """组装顺序/构成：boundary + cache(项目根) + git(项目根) + temp + shared。
+
+    shared（s3c09 git×ACL 修复）仅在 worktree 边界（boundary != project）
+    追加，派生自**项目根**。
+    """
     boundary = str(tmp_path / "worktree-A")
     project = str(tmp_path)
     t = temp_sid(str(tmp_path / "t"))
@@ -44,6 +50,7 @@ def test_build_write_sids_structure(tmp_path) -> None:
         cache_sid(project),       # cache/git SID 派生自**项目根**（§4.8/§8）
         git_sid(project),
         t,
+        shared_sid(project),      # shared SID 派生自项目根（worktree 边界才带）
     ]
 
 
@@ -101,6 +108,9 @@ def test_resolve_policy_full(tmp_path) -> None:
     assert p.venv_sid_str in p.write_sids
     assert p.venv_dir == str(tmp_path / ".venv")
     assert len(p.write_sids) == 5
+    # s3c09 修复：项目根边界（root == project）不带 shared SID，授予面不变
+    assert p.shared_sid_str is None
+    assert p.shared_dir == str(tmp_path / SHARED_REL)
 
 
 def test_resolve_policy_project_root_override(tmp_path) -> None:
@@ -114,6 +124,34 @@ def test_resolve_policy_project_root_override(tmp_path) -> None:
     assert p.cache_dir == str(tmp_path / ".hiveweave-cache")
     assert p.write_sids[1] == cache_sid(project)
     assert p.write_sids[2] == git_sid(project)
+
+
+def test_resolve_policy_shared_fields_worktree_boundary(tmp_path) -> None:
+    """s3c09 修复：worktree 边界携带项目级 shared SID；项目根边界不携带。"""
+    project = str(tmp_path)
+    wt = str(tmp_path / ".hiveweave" / "worktrees" / "A")
+    p = resolve_policy(workspace_path=wt, agent_id="A001",
+                       project_workspace_path=project)
+    assert p.shared_dir == str(tmp_path / ".hiveweave" / "worktrees" / "A"
+                               / SHARED_REL)
+    assert p.shared_sid_str == shared_sid(project)
+    assert shared_sid(project) in p.write_sids
+
+    p_root = resolve_policy(workspace_path=project, agent_id="CEO",
+                            project_workspace_path=project)
+    assert p_root.shared_sid_str is None
+    assert shared_sid(project) not in p_root.write_sids
+
+
+def test_shared_sid_same_across_worktrees(tmp_path) -> None:
+    """per-project 而非 per-agent：同项目两个 worktree 携带同一 shared SID。"""
+    project = str(tmp_path)
+    t = temp_sid(str(tmp_path / "t"))
+    a = build_write_sids(str(tmp_path / ".hiveweave" / "worktrees" / "A"),
+                         project, t)
+    b = build_write_sids(str(tmp_path / ".hiveweave" / "worktrees" / "B"),
+                         project, t)
+    assert a[-1] == b[-1] == shared_sid(project)
 
 
 def test_resolve_policy_unknown_entry_fail_closed(tmp_path) -> None:

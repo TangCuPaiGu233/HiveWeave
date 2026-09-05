@@ -5,6 +5,12 @@ workspace 迁移/路径改名 → 新路径派生新 SID 全套；旧树遗留�
 本工具遍历目录树，删除所有 `S-1-4-*` 前缀 ACE（走本模块代码路径 ——
 实测 `icacls /remove` 对该形态失败，须经 win32security 原语）。
 
+注意（s3c09 shared 修复，2026-09-05）：对 worktree/项目根跑本清理**会一并
+剥掉 `.hiveweave/shared` 子树的 shared_sid ACE**（同为 S-1-4-* 能力位）——
+该 ACE 是 git 跟踪共享区的受限写能力，剥掉后由 standing-grants 的
+`_repair_shared_islands_once` walker（水位 + verify-then-skip，失败/截断
+不落水位自动重试）在下一轮受限命令恢复，无需手工重授。
+
 用法：
     python -m hiveweave.services.acl_sandbox.cleanup <path> [--dry-run]
 

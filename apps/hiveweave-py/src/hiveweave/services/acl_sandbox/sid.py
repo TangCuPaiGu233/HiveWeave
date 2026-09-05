@@ -44,6 +44,17 @@ def git_sid(workspace_path: str) -> str:
     return _digest_sid("git", workspace_path)
 
 
+def shared_sid(workspace_path: str) -> str:
+    """项目共享契约区 `.hiveweave/shared/`（s3c09 git×ACL 死锁修复）。
+
+    **per-project**（派生自项目根，同项目全 agent 同一 SID），不是
+    per-anchor —— shared 本意就是跨 agent 共享；各 worktree 内嵌的
+    `.hiveweave/shared` 子树共用这同一能力（ACE 逐边界落盘，SID 全项目
+    一致）。域分离前缀防与 worktree/git/temp 撞车。
+    """
+    return _digest_sid("shared", workspace_path)
+
+
 def temp_sid(temp_dir: str) -> str:
     """agent 私有 temp（§4.3/§7.2）；extra=(1,) 对齐 DSH。"""
     return _digest_sid("temp", temp_dir, (1,))

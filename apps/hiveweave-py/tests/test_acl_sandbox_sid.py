@@ -9,6 +9,7 @@ from hiveweave.services.acl_sandbox.sid import (
     extra_sid,
     git_sid,
     project_root_sid,
+    shared_sid,
     temp_sid,
     worktree_sid,
 )
@@ -20,16 +21,27 @@ def test_worktree_and_project_root_share_derivation(tmp_path: Path) -> None:
 
 
 def test_domain_separation_same_path(tmp_path: Path) -> None:
-    """同一路径下五类域必须互不撞车（cache/git/temp/extra 各有前缀）。"""
+    """同一路径下六类域必须互不撞车（cache/git/shared/temp/extra 各有前缀）。"""
     p = str(tmp_path)
     sids = {
         worktree_sid(p),
         cache_sid(p),
         git_sid(p),
+        shared_sid(p),
         temp_sid(p),
         extra_sid(p),
     }
-    assert len(sids) == 5, f"domain separation broken: {sids}"
+    assert len(sids) == 6, f"domain separation broken: {sids}"
+
+
+def test_shared_sid_deterministic_and_per_project(tmp_path: Path) -> None:
+    """shared SID（s3c09 修复）：同项目根重复派生一致；跨项目不同。"""
+    a = tmp_path / "proj-a"
+    b = tmp_path / "proj-b"
+    a.mkdir()
+    b.mkdir()
+    assert shared_sid(str(a)) == shared_sid(str(a))
+    assert shared_sid(str(a)) != shared_sid(str(b))
 
 
 def test_temp_extra_subauthority(tmp_path: Path) -> None:

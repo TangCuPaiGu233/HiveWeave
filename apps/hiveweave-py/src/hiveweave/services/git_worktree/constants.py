@@ -76,6 +76,16 @@ GITIGNORE_GENERATED_ENTRIES: tuple[str, ...] = (
     # B-2 平台审计产物：首轮审计遗留 .audit/ untracked 噪音；git ignore 后平台
     # Remove-Item -Recurse 清理流程不再碰它，避免撞 120s 权限超时。
     ".audit/",
+    # P0（2026-09-05，s3c09 git×ACL 交集）：.hiveweave 私有区（sandbox-temp/
+    # data.db/tool_outputs/logs 等）不再新增跟踪 —— 本清单走 .git/info/exclude
+    # （优先级低于 tracked .gitignore，老仓库模板反选不受扰；已跟踪文件不受
+    # ignore 影响，只拦「新 add」）。反选四共享目录必须跟在 .hiveweave/* 之后
+    # （同文件内 gitignore 后行覆盖前行），否则新写入的共享产物会被误忽略。
+    ".hiveweave/*",
+    "!.hiveweave/shared/",
+    "!.hiveweave/reports/",
+    "!.hiveweave/drafts/",
+    "!.hiveweave/handoffs/",
 )
 
 # BUG-4: serialize create per (workspace, short_id) so hire + lazy-ensure

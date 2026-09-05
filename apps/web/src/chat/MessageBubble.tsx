@@ -3,6 +3,7 @@ import type { ChatMessage, ContextMarkerKind, ToolCall } from "./types";
 import { CHAT_MOTION_CSS, toolCategories } from "./constants";
 import { formatToolInputHint } from "./messageUtils";
 import { estimateMessageTokens, estimateTokens } from "./tokenEstimate";
+import { MarkdownText } from "./MarkdownText";
 
 /**
  * DSH 风格思考行：单行 `Think · 摘要`，点击展开全文。
@@ -213,7 +214,6 @@ function ContextMarkerRow({ kind, content }: { kind: ContextMarkerKind; content:
   );
 }
 
-/** 来源徽章 —— 气泡的核心职责：一眼看出这条消息来自谁。 */
 /**
  * 轮次分隔线（round_boundary 段）：多轮 tool-loop 的轮与轮之间。
  * live（draft 的 beginStreamRound）与持久化（metadata.segments 的
@@ -458,16 +458,25 @@ function MessageBubbleInner({
           <div>
             {!isUser && thinking && !segmentsHaveThinking && <ThinkingBlock content={thinking} />}
             {segments.map((seg, i) => {
-              if (seg.type === "thinking" && seg.content) {
               if (seg.type === "round_boundary") {
                 // live 与持久化共用此分支（渲染统一）：轮次分隔线不参与
                 // 文本流，永远独立成行。
                 return <RoundBoundaryRow key={`round-${seg.round ?? i}`} round={seg.round} />;
               }
                 return <ThinkingBlock key={`think-${i}`} content={seg.content} />;
+              if (seg.type === "thinking" && seg.content) {
               }
               if (seg.type === "text" && seg.content) {
                 return (
+                // P1 安全门（审计 2026-09-05）：markdown 仅限 assistant text 段。
+                // 当前没有 user 消息携带 segments 的路径，但未来任何路径挂上了，
+                // 此门兜住「用户输入被静默按 markdown 语义渲染」——用户文本按
+                // 字面显示不变。
+                if (!isUser) {
+                  // P0 富文本：text 段走 markdown 渲染（安全基线见 MarkdownText.tsx
+                  // 头注释）。段落节奏由 .hw-md p{margin:.25rem 0} 保持原 my-1 观感。
+                  return <MarkdownText key={`text-${i}`} content={seg.content} />;
+                }
                   <p key={`text-${i}`} className="whitespace-pre-wrap my-1">
                     {seg.content}
                   </p>

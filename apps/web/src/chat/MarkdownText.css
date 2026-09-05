@@ -1,0 +1,161 @@
+/* text 段 markdown 渲染样式基线（P0）。
+   对标 DSH ui-primitives/markdown/MarkdownText.module.css 的做法：排版节奏
+   收敛在这一个作用域（.hw-md），组件 override 只管安全属性，不散落样式。
+   色板沿用气泡的 slate 系（assistant 气泡白底 + g-fg 前景）。 */
+
+.hw-md {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  /* 与原 whitespace-pre-wrap <p> 同基线：气泡容器 14px / leading-relaxed */
+  font-size: 14px;
+  line-height: 1.625;
+}
+
+/* 原 text 段为 <p class="my-1">：保持 0.25rem 节奏，相邻块间 margin 自然折叠 */
+.hw-md p {
+  margin: 0.25rem 0;
+}
+
+/* ── 链接 ── */
+.hw-md a {
+  color: #2563eb;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+}
+.hw-md a:hover {
+  color: #1d4ed8;
+}
+
+/* ── 行内代码 ── */
+.hw-md code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+  font-size: 0.875em;
+  background: rgba(15, 23, 42, 0.06);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+  overflow-wrap: anywhere;
+}
+
+/* ── 围栏代码块：等宽 + 横向滚动 ── */
+.hw-md pre {
+  margin: 0.375rem 0;
+  padding: 0.625rem 0.875rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.hw-md pre code {
+  display: block;
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+  white-space: pre;
+  overflow-wrap: normal;
+  min-width: max-content;
+}
+
+/* ── 列表 / 任务列表 ── */
+.hw-md ul,
+.hw-md ol {
+  margin: 0.25rem 0;
+  padding-left: 1.5rem;
+}
+.hw-md ul {
+  list-style: disc;
+}
+.hw-md ol {
+  list-style: decimal;
+}
+.hw-md li {
+  margin: 0.125rem 0;
+}
+.hw-md li > ul,
+.hw-md li > ol {
+  margin: 0.125rem 0;
+}
+.hw-md li::marker {
+  color: #94a3b8;
+}
+.hw-md input[type="checkbox"] {
+  margin-right: 0.375rem;
+  vertical-align: middle;
+}
+
+/* ── 标题：聊天气泡内弱化层级节奏 ── */
+.hw-md h1,
+.hw-md h2,
+.hw-md h3,
+.hw-md h4,
+.hw-md h5,
+.hw-md h6 {
+  margin: 0.625rem 0 0.25rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.hw-md h1 {
+  font-size: 1.25em;
+}
+.hw-md h2 {
+  font-size: 1.15em;
+}
+.hw-md h3 {
+  font-size: 1.05em;
+}
+.hw-md h4,
+.hw-md h5,
+.hw-md h6 {
+  font-size: 1em;
+}
+.hw-md :is(h1, h2, h3, h4, h5, h6) strong {
+  font-weight: inherit;
+}
+
+/* ── 引用 / 分隔线 ── */
+.hw-md blockquote {
+  margin: 0.375rem 0;
+  padding: 0.125rem 0.75rem;
+  border-left: 3px solid #cbd5e1;
+  color: #475569;
+}
+.hw-md hr {
+  margin: 0.625rem 0;
+  border: none;
+  border-top: 1px solid #e2e8f0;
+}
+
+/* ── 表格：窄表贴气泡宽，溢出横向滚动 ── */
+.hw-md table {
+  margin: 0.375rem 0;
+  border-collapse: collapse;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  font-size: 0.9em;
+}
+.hw-md th,
+.hw-md td {
+  border: 1px solid #e2e8f0;
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+.hw-md th {
+  background: #f8fafc;
+  font-weight: 600;
+}
+
+/* ── 图片（markdown 内联，绝对 http(s) 才渲染，见 MarkdownText.tsx） ── */
+.hw-md img {
+  max-width: 100%;
+  border-radius: 8px;
+  margin: 0.25rem 0;
+}
+.hw-md .hw-md-img-alt {
+  color: #64748b;
+  font-size: 0.85em;
+}

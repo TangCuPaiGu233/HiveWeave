@@ -192,3 +192,17 @@ _lib_*.js
 
 # Platform-issue research reports (本地归档，不进远程)
 docs/platform-issue-research/
+
+# Office scene working artifacts (备份图 & LaMa 修图中间产物；生产图无后缀已入库)
+apps/web/public/office-assets/*.bak.png
+apps/web/public/office-assets/*.patched.png
+
+# Local AI memory backups (AI_MEMORY.local.md 已 ignore，备份同精神)
+AI_MEMORY.local.md.bak*
+
+# tasks 工作产物：冻结 DB 快照 / 调试图目录 / tar 中转包 / 内联 three.js 的超大自检文件 / 提交信息草稿
+tasks/_desk_debug/
+tasks/_v45_snap/
+tasks/_s310_app.tar.gz
+tasks/_standalone_check.mjs
+tasks/commit-msg-*.txt

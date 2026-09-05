@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
-from .verify import normalize_verdict
+from .acceptance import format_acceptance_coverage_error, uncovered_acceptance_items
+from .verify import normalize_verdict, verdict_evidence_gaps
 
 log = structlog.get_logger(__name__)
 
@@ -47,6 +48,15 @@ class SubmitMixin:
         # 带强制判定字段，否则硬拒提交（transition 之前拦截）。
         if task and self._is_verify_task(task):
             self._validate_verdict_evidence(evidence)
+            # 任务6（门禁智能化包）：VERIFY 任务带非空 acceptance_criteria 时，
+            # verdict evidence 必须逐条体现覆盖（条目原文/编号可匹配，或显式
+            # 「N/A: <理由>」）。缺覆盖 → 拒绝并列出缺哪几条 + 处方。清单为空
+            # 的任务不受影响；check_evidence_verifiable 的 VERIFY 跳过保持不动。
+            gaps = uncovered_acceptance_items(
+                task.get("acceptance_criteria"), evidence
+            )
+            if gaps:
+                raise ValueError(format_acceptance_coverage_error(gaps))
             # E5 断流收口纪律：降级中提交 verdict=FAIL 属「waiver 型就地
             # 收口」——必须续跑重验或升级 coordinator，不许抢在续跑前
             # 用 FAIL 提交替豁免收口（复盘终验三连打断后 waiver 收口）。
@@ -215,29 +225,14 @@ class SubmitMixin:
         verdict ∈ {PASS, FAIL}；verdict=FAIL 时 blocking_issues 必须为非空
         list。缺失或非法 → ValueError，点名缺什么（对齐 SUBMIT PRE-RUN
         FAILED 硬拒风格）。非终验任务无需这些字段，由调用方按谓词筛选。
+        判定逻辑单源在 ``verify.verdict_evidence_gaps``（工具层聚合预检
+        复用同一份，文案保持一致）。
         """
-        if not isinstance(evidence, dict):
+        gaps = verdict_evidence_gaps(evidence)
+        if gaps:
             raise ValueError(
-                "SUBMIT VERDICT REJECTED (verify task): "
-                "evidence 必须是 dict 才能判定 verdict"
+                "SUBMIT VERDICT REJECTED (verify task): " + "；".join(gaps)
             )
-        verdict = normalize_verdict(evidence.get("verdict"))
-        if verdict is None:
-            raw = evidence.get("verdict")
-            missing = "verdict" if raw in (None, "") else f"verdict={raw!r}"
-            raise ValueError(
-                "SUBMIT VERDICT REJECTED (verify task): "
-                f"evidence 缺判定字段（缺：{missing}），"
-                "期望 verdict ∈ {PASS, FAIL}（大小写不敏感）"
-            )
-        if verdict == "FAIL":
-            blocking = evidence.get("blocking_issues")
-            if not isinstance(blocking, list) or not blocking:
-                raise ValueError(
-                    "SUBMIT VERDICT REJECTED (verify task): "
-                    "verdict=FAIL 时 blocking_issues 必须为非空 list "
-                    "（当前缺失或为空）"
-                )
 
     @staticmethod
     def _is_degraded_assignee(task: dict | None) -> bool:

@@ -20,6 +20,32 @@ from hiveweave.tools.result import ToolResult
 
 log = structlog.get_logger(__name__)
 
+# ── 门禁智能化包任务3：review/submit race 事实位 ─────────────────────
+# 与下方 running 态重读前的 asyncio.sleep(2.5) 同源：等待 2.5s 后重读，
+# 外加落库余量 → 预计可审窗口取 5s。只增事实位，处方文案保持不变。
+_RACE_RECHECK_SLEEP_SECONDS = 2.5
+_RACE_RETRY_WINDOW_SECONDS = 5
+
+
+def _race_fact_bit(task: dict | None) -> str:
+    """race 拒绝附事实位：该任务提交于 X 秒前，预计 N 秒内可审。"""
+    submitted_at = (task or {}).get("submitted_at")
+    if submitted_at:
+        try:
+            age_s = max(0.0, (time.time() * 1000 - int(submitted_at)) / 1000.0)
+            return (
+                f"Fact: this task was submitted {age_s:.0f}s ago; it should "
+                f"become reviewable within ~{_RACE_RETRY_WINDOW_SECONDS}s "
+                f"(submit lands, then the state re-checks after "
+                f"{_RACE_RECHECK_SLEEP_SECONDS}s)."
+            )
+        except (TypeError, ValueError):
+            pass
+    return (
+        "Fact: no submitted_at timestamp yet — the submission is still "
+        "being written to the ledger."
+    )
+
 # ── review_task ─────────────────────────────────────────
 
 
@@ -41,6 +67,25 @@ class ReviewTaskParams(BaseModel):
         description="Review feedback (optional).",
         json_schema_extra={"aliases": ["feedback", "comment", "comments"]},
     )
+    files_changed: list[str] | None = Field(
+        default=None,
+        alias="filesChanged",
+        description=(
+            "Optional: paths YOU reviewed in the assignee worktree. When "
+            "provided, this list substitutes for the submission's "
+            "evidence.files_changed in the worktree proof gate — use it "
+            "when that list is empty or wrong (e.g. pure-doc tasks) "
+            "instead of bouncing the task to re-submit formality fields."
+        ),
+        json_schema_extra={
+            "aliases": ["filesChanged", "files_changed", "files"]
+        },
+    )
+
+    @field_validator("files_changed", mode="before")
+    @classmethod
+    def _coerce_files_changed(cls, v: Any) -> Any:
+        return _coerce_to_list(v)
 
 
 @tool(
@@ -50,6 +95,8 @@ class ReviewTaskParams(BaseModel):
     "Prefer consuming the assignee's hung attestations (unit→test_run, module_visual→browse_e2e, "
     "docs→doc_review, code_audit*→code_audit). CEO: review-only — do not bash/self-test or merge leaf trees. "
     "If approve is rejected for missing evidence, do NOT retry approve — rework or wait for the gate. "
+    "Optional filesChanged=[...]: paths YOU reviewed in the assignee worktree; substitutes for the "
+    "submission's empty/wrong evidence.files_changed (e.g. pure-doc tasks) instead of bouncing the task. "
     "Submitting evidence verdict=FAIL (VERIFY) auto-reroutes approve to rework — "
     "FAIL must be fixed, never silently closed. "
     "Does NOT spawn VERIFY. After a milestone is on MAIN, dispatch_task(..., milestoneVerify=true) "
@@ -81,7 +128,8 @@ async def review_task_tool(
         # B3: 归档任务写保护 —— 已归档任务不可审批
         if task.get("is_archived"):
             return ToolResult.err(
-                f"Task {params.task_id[:8]} is archived and cannot be reviewed. "
+                f"Task {task.get('id') or params.task_id} is archived and "
+                "cannot be reviewed (full id above — copy directly). "
                 f"It has been cancelled by a coordinator."
             )
 
@@ -93,6 +141,8 @@ async def review_task_tool(
         waiver_row = None
         ceo_merger_override = False
         waive_self_approve_small_team = False
+        # 审计 epic P0（门禁包配套）：tool_failure 类豁免发起人保留审批权。
+        waiver_tool_failure_self_approve = False
         if ts._is_verify_task(task):
             from hiveweave.services.attestation import get_valid_waiver
 
@@ -215,35 +265,55 @@ async def review_task_tool(
             if waived and waiver_row:
                 waived_by = str(waiver_row.get("agent_id") or "")
                 if waived_by and waived_by == str(agent_id):
-                    from hiveweave.services.unblock_soft import (
-                        is_org_lookup_failed,
-                        is_small_team_sole_reviewer,
-                        no_lawful_approver,
-                    )
+                    # 审计 epic P0：waiver 按原因分流。tool_failure 类豁免
+                    # （工具/上游失败）发起人**保留**审批权 —— 仅放行 approve；
+                    # quality（默认，含 NULL/未知值归一）拒绝语义逐字保持，
+                    # rework 亦不放松。
+                    from hiveweave.services.attestation import normalize_waiver_kind
 
-                    sole = await is_small_team_sole_reviewer(
-                        project_id,
-                        assignee_id=str(task.get("assignee_id") or "") or None,
-                        reviewer_id=str(agent_id),
-                    )
-                    if sole:
-                        waive_self_approve_small_team = True
+                    if (
+                        decision == "approve"
+                        and normalize_waiver_kind(
+                            waiver_row.get("waiver_kind")
+                        )
+                        == "tool_failure"
+                    ):
+                        waiver_tool_failure_self_approve = True
+                        log.info(
+                            "waiver_tool_failure_self_approve_allowed",
+                            task_id=params.task_id,
+                            waived_by=waived_by,
+                        )
                     else:
-                        deadlock = await no_lawful_approver(
-                            project_id, task, waiver_row=waiver_row
+                        from hiveweave.services.unblock_soft import (
+                            is_org_lookup_failed,
+                            is_small_team_sole_reviewer,
+                            no_lawful_approver,
                         )
-                        extra = ""
-                        if deadlock and not is_org_lookup_failed(deadlock):
-                            extra = f"\nDEADLOCK: {deadlock}"
-                        return ToolResult.err(
-                            "Cannot approve: you issued the waiver for this task. "
-                            "waive→approve requires a third party "
-                            f"(waived_by={waived_by[:8]}…). "
-                            "Ask another coordinator/CEO to approve, or obtain "
-                            "real reviewer test_run attestation and approve "
-                            "without relying on your own waiver."
-                            + extra
+
+                        sole = await is_small_team_sole_reviewer(
+                            project_id,
+                            assignee_id=str(task.get("assignee_id") or "") or None,
+                            reviewer_id=str(agent_id),
                         )
+                        if sole:
+                            waive_self_approve_small_team = True
+                        else:
+                            deadlock = await no_lawful_approver(
+                                project_id, task, waiver_row=waiver_row
+                            )
+                            extra = ""
+                            if deadlock and not is_org_lookup_failed(deadlock):
+                                extra = f"\nDEADLOCK: {deadlock}"
+                            return ToolResult.err(
+                                "Cannot approve: you issued the waiver for this task. "
+                                "waive→approve requires a third party "
+                                f"(waived_by={waived_by}). "
+                                "Ask another coordinator/CEO to approve, or obtain "
+                                "real reviewer test_run attestation and approve "
+                                "without relying on your own waiver."
+                                + extra
+                            )
             if needed and not waived:
                 aids = evidence.get("attestation_ids") or []
                 if not isinstance(aids, list):
@@ -392,7 +462,7 @@ async def review_task_tool(
                             )
                             for r in rows:
                                 r = dict(r)
-                                r["holder"] = cid[:8]
+                                r["holder"] = cid
                                 consume_held.append(r)
                     mismatch = format_attestation_mismatch_hint(
                         held, target_task_id=str(tid)
@@ -406,8 +476,8 @@ async def review_task_tool(
                             bound = h.get("task_id") or "(unbound)"
                             mismatch += (
                                 f"\n  - holder={h.get('holder')} "
-                                f"{h.get('kind')} id={str(h.get('id') or '')[:8]}… "
-                                f"bound_task={str(bound)[:8]}"
+                                f"{h.get('kind')} id={h.get('id')} "
+                                f"bound_task={bound}"
                             )
                     from hiveweave.services.unblock_soft import (
                         is_org_lookup_failed,
@@ -489,8 +559,12 @@ async def review_task_tool(
                         task_id=params.task_id,
                         error=str(e),
                     )
+            # 门禁智能化包任务5：reviewer 显式传 filesChanged 时，用它替代
+            # task.evidence.files_changed 做 worktree 证据判定（纯文档任务/
+            # 清单缺失不再被迫退回重提两轮补形式字段）。
             wt_deny, wt_meta = await review_worktree_gate(
-                project_id, task, evidence
+                project_id, task, evidence,
+                reviewer_files=params.files_changed,
             )
             if wt_deny:
                 return ToolResult.err(wt_deny)
@@ -564,7 +638,7 @@ async def review_task_tool(
                     "Task is 'running' — a submission is likely still landing "
                     "(review/submit race). WAIT a few seconds and retry the "
                     "same review_task call; do NOT rework or punish the "
-                    "assignee based on this state."
+                    "assignee based on this state.\n" + _race_fact_bit(task)
                 )
             elif current_status != "reviewing":
                 return ToolResult.err(
@@ -580,7 +654,7 @@ async def review_task_tool(
                     "Task is 'running' — a submission is likely still landing "
                     "(review/submit race). WAIT a few seconds and retry the "
                     "same review_task call; do NOT rework or punish the "
-                    "assignee based on this state."
+                    "assignee based on this state.\n" + _race_fact_bit(task)
                 )
             elif current_status not in ("reviewing", "approved"):
                 return ToolResult.err(
@@ -630,7 +704,11 @@ async def review_task_tool(
         if (
             decision == "approve"
             and not forced_rework
-            and (ceo_merger_override or waive_self_approve_small_team)
+            and (
+                ceo_merger_override
+                or waive_self_approve_small_team
+                or waiver_tool_failure_self_approve
+            )
         ):
             try:
                 import time as _time
@@ -652,6 +730,10 @@ async def review_task_tool(
                     ev["override"] = "waive_self_approve_small_team"
                     ev["waive_self_approve_small_team"] = True
                     ev["waive_self_approve_by"] = agent_id
+                if waiver_tool_failure_self_approve:
+                    ev["override"] = "waiver_tool_failure_self_approve"
+                    ev["waiver_tool_failure_self_approve"] = True
+                    ev["waiver_tool_failure_self_approve_by"] = agent_id
                 from hiveweave.services import task as task_module
 
                 await task_module._execute(
@@ -751,6 +833,13 @@ async def review_task_tool(
         # forced_rework（approve 被 service 强制转 rework）→ 跳过合并/关闭
         # 收尾：任务仍在返修中，不注入 merge pending（E2 修复配套）。
         if decision == "approve" and not forced_rework:
+            # tool_failure 自批放行 → 每条 approve 回执明示豁免类型与依据。
+            tf_note = (
+                "\n[waiver] tool_failure 自批放行：工具失败类豁免，发起人保留"
+                f"审批权（waived_by={agent_id}，见 evidence.override 审计戳）。"
+                if waiver_tool_failure_self_approve
+                else ""
+            )
             from hiveweave.services.worktree_review import (
                 agent_worktree_path,
                 worktree_commits_ahead,
@@ -761,7 +850,7 @@ async def review_task_tool(
                 return ToolResult.ok(
                     "VERDICT: APPROVE. "
                     f"VERIFY task {params.task_id} approved — parent closed. "
-                    "No git_worktree_merge needed."
+                    "No git_worktree_merge needed." + tf_note
                 )
 
             asg = (task_after or {}).get("assignee_id")
@@ -829,11 +918,13 @@ async def review_task_tool(
                             f"Task {params.task_id} approved; worktree already on "
                             f"main (0 commits ahead, clean). "
                             f"Close manually if needed ({e}). No merge required."
+                            + tf_note
                         )
                     return ToolResult.ok(
                         f"Task {params.task_id} approved and closed — "
                         f"already on main (0 commits ahead, clean, merge/no-code "
                         f"fact present). No git_worktree_merge needed."
+                        + tf_note
                     )
                 await _inject_merge_pending_wake(
                     project_id=project_id,
@@ -848,6 +939,7 @@ async def review_task_tool(
                     f"no merge fact). Executor must implement + checkpoint, "
                     f"or stamp evidence.no_code_change=true, or "
                     f"waive_merge(reason=…). Not treating as done."
+                    + tf_note
                 )
 
             if (ahead == 0 and has_claimed_files) or dirty > 0:
@@ -868,6 +960,7 @@ async def review_task_tool(
                     f"as already-merged. Next: confirm checkpoint, then the "
                     f"merge owner (task creator/coordinator) runs "
                     f"git_worktree_merge(branchName='{short or 'hw/<short_id>/...'}')."
+                    + tf_note
                 )
 
             await _inject_merge_pending_wake(
@@ -891,6 +984,7 @@ async def review_task_tool(
                 f"On real content conflict: rework executor to rebase/merge "
                 f"main in their worktree. On untracked-on-main: that is MAIN "
                 f"hygiene — retry merge (auto-quarantine), do NOT rework."
+                + tf_note
             )
         if forced_rework:
             return ToolResult.ok(
@@ -937,7 +1031,7 @@ async def _inject_merge_pending_wake(
 
     recipient = resolve_merge_owner(task, reviewer_id) or reviewer_id
     body = (
-        f"[MERGE PENDING] Task '{title}' ({tid[:8]}) is approved and needs "
+        f"[MERGE PENDING] Task '{title}' ({tid}) is approved and needs "
         f"git_worktree_merge(branchName='{branch}'). "
         f"YOU (task creator/coordinator, merge owner) must merge — do not "
         f"ask the executor to merge on main. "
@@ -1043,7 +1137,7 @@ async def _auto_rework_on_evidence_gate(
                 from_agent_id=agent_id,
                 to_agent_id=assignee_id,
                 message=(
-                    f"[REWORK REQUESTED] Task '{str(tid)[:8]}' auto-reworked "
+                    f"[REWORK REQUESTED] Task '{tid}' auto-reworked "
                     f"by approval evidence gate: {deny_msg[:200]}"
                 ),
                 message_type="task",

@@ -56,6 +56,34 @@ def normalize_verdict(value: Any) -> str | None:
     return None
 
 
+def verdict_evidence_gaps(evidence: Any) -> list[str]:
+    """E1 非抛版审计：返回 verdict evidence 的缺失/非法点（空 list = 通过）。
+
+    与 ``SubmitMixin._validate_verdict_evidence`` 单源同文案 —— 工具层
+    submit 聚合预检（门禁智能化包任务1）复用本函数，把 E1 问题提前并进
+    「一次报全」回执；服务层硬门保持原样（API 直提仍被拒绝，双重防御）。
+    """
+    if not isinstance(evidence, dict):
+        return ["evidence 必须是 dict 才能判定 verdict"]
+    gaps: list[str] = []
+    verdict = normalize_verdict(evidence.get("verdict"))
+    if verdict is None:
+        raw = evidence.get("verdict")
+        missing = "verdict" if raw in (None, "") else f"verdict={raw!r}"
+        gaps.append(
+            "evidence 缺判定字段（缺：" + missing + "），"
+            "期望 verdict ∈ {PASS, FAIL}（大小写不敏感）"
+        )
+    elif verdict == "FAIL":
+        blocking = evidence.get("blocking_issues")
+        if not isinstance(blocking, list) or not blocking:
+            gaps.append(
+                "verdict=FAIL 时 blocking_issues 必须为非空 list "
+                "（当前缺失或为空）"
+            )
+    return gaps
+
+
 def evidence_merge_recorded(task: dict | None) -> bool:
     """True when evidence records a merge covering the current approved revision.
 

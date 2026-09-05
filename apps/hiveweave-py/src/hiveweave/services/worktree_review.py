@@ -8,6 +8,7 @@ P0 contract (human-aligned):
 
 from __future__ import annotations
 
+import posixpath
 import re
 from pathlib import Path
 from typing import Any
@@ -174,6 +175,36 @@ def _rel_paths(files: list[Any]) -> list[str]:
 
 def _norm_set(files: list[Any] | None) -> set[str]:
     return set(_rel_paths(list(files or [])))
+
+
+# ── 门禁智能化包任务5：doc_review 分档 ──────────────────────────────
+# 文档路径口径：.md / .markdown / .txt 扩展名，或 docs/**（含 doc/**）目录。
+_DOC_EXTS = (".md", ".markdown", ".txt")
+
+
+def _has_parent_segment(rel: str) -> bool:
+    """路径是否含 ``..`` 段（穿越嫌疑；反斜杠已归一为 /）。"""
+    return ".." in str(rel or "").replace("\\", "/").split("/")
+
+
+def _is_doc_path(rel: str) -> bool:
+    n = str(rel or "").replace("\\", "/").strip().lower()
+    if not n:
+        return False
+    # P1（审计）：穿越路径一律不按文档分档 —— ``docs/../src/auth.py`` 曾可
+    # 借 docs/ 前缀伪装成文档，借分档的「存在即放行（worktree or MAIN）」
+    # 整体跳过 compare_worktree_to_main 硬门。
+    if _has_parent_segment(n):
+        return False
+    # docs/ 前缀规则放在 normpath 之后（``docs/../x`` 归一后不再带前缀）
+    n = posixpath.normpath(n)
+    if n.startswith("docs/") or n.startswith("doc/"):
+        return True
+    return n.endswith(_DOC_EXTS)
+
+
+def _all_doc_paths(files: list[str]) -> bool:
+    return bool(files) and all(_is_doc_path(f) for f in files)
 
 
 async def worktree_commits_ahead(
@@ -408,7 +439,10 @@ def compare_worktree_to_main(
         return (
             "Approve blocked: evidence.files_changed is empty. "
             "List the paths you reviewed in the assignee worktree "
-            "(not main). Without that list there is no worktree proof. "
+            "(not main) — pass them on THIS review_task call as "
+            "filesChanged=[...] and the reviewer-side list substitutes "
+            "for the submission's empty one. Without that list there is "
+            "no worktree proof. "
             "Pure verification / no-code tasks: submit with attestation "
             "and empty files_changed only when the worktree has 0 commits "
             "ahead of main (or tag the task VERIFY).",
@@ -533,11 +567,17 @@ async def review_worktree_gate(
     project_id: str,
     task: dict[str, Any],
     evidence: dict[str, Any],
+    *,
+    reviewer_files: list[Any] | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
     """Hard gate for approve: code tasks need worktree proof; verify/no-diff do not.
 
     Pure verification (VERIFY: title prefix, or 0 commits ahead of main with empty
     files_changed) must be approvable — otherwise CEO can only cancel.
+
+    门禁智能化包任务5：``reviewer_files``（review_task 的 filesChanged 入参）
+    非空时**替代** evidence.files_changed 参与 worktree 证据判定；纯文档清单
+    走 doc_review 分档（只校验文件存在即放行）。
     """
     from hiveweave.services.task import TaskService
 
@@ -609,12 +649,18 @@ async def review_worktree_gate(
             return (
                 "Approve blocked: implementer/assignee has no worktree path. "
                 + hint
-                + f" evidenceAgent={str(evidence_agent)[:8]}",
+                + f" evidenceAgent={evidence_agent}",
                 meta,
             )
     meta["worktreeWorkspace"] = wt
 
     files = evidence.get("files_changed") or evidence.get("filesChanged") or []
+    # 门禁智能化包任务5：reviewer 显式 filesChanged → 替代提交侧清单
+    # （「请在 review_task 调用中传 filesChanged」的落点）。
+    _reviewer_rels = _rel_paths(list(reviewer_files or []))
+    if _reviewer_rels:
+        files = _reviewer_rels
+        meta["files_changed_source"] = "reviewer_files_changed"
     ahead = await worktree_commits_ahead(main_ws, wt)
     meta["commitsAhead"] = ahead
 
@@ -645,6 +691,49 @@ async def review_worktree_gate(
                     task_id=task.get("id"),
                     count=len(derived),
                 )
+
+    # ── doc_review 分档（门禁智能化包任务5）：files_changed 全部为文档
+    # 路径（.md/.markdown/.txt/docs/**）→ 按文档任务放行 approve，只校验
+    # 文件存在于 worktree/MAIN 即可；代码任务的 diverged 比对不适用纯文档
+    # 交付。非全文档清单照走原 compare 门，不放行。
+    doc_rels = _rel_paths(list(files or []))
+    # P1（审计）：含 ``..`` 段的路径拒绝进 doc 分档（分档存在性检查是
+    # worktree or MAIN，穿越路径可借此整体跳过 compare 硬门）→ 留痕后
+    # 落回原 compare 门，按代码路径正常裁决。
+    _traversal = [r for r in doc_rels if _has_parent_segment(r)]
+    if _traversal:
+        meta["path_traversal_suspect"] = _traversal[:8]
+        log.warning(
+            "review_path_traversal_refused_doc_tier",
+            task_id=task.get("id"),
+            paths=_traversal[:8],
+        )
+    if doc_rels and _all_doc_paths(doc_rels):
+        wt_root = Path(wt)
+        main_root = Path(main_ws)
+        missing_doc = [
+            rel
+            for rel in doc_rels[:40]
+            if not (wt_root / rel).is_file() and not (main_root / rel).is_file()
+        ]
+        if missing_doc:
+            meta["doc_review_tier"] = "missing_files"
+            return (
+                "Approve blocked: doc-only files_changed reference files that "
+                f"do not exist in the assignee worktree or MAIN: "
+                f"{missing_doc[:8]}. Fix the list, or pass "
+                "review_task(filesChanged=[...]) with the real doc paths, "
+                "and retry approve.",
+                meta,
+            )
+        meta["skipped"] = "doc_review_tier"
+        meta["doc_review_tier"] = "allowed"
+        log.info(
+            "review_doc_review_tier_allowed",
+            task_id=task.get("id"),
+            files=len(doc_rels),
+        )
+        return None, meta
 
     deny, cmp_meta = compare_worktree_to_main(
         main_ws=main_ws,

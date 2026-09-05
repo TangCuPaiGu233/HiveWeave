@@ -28,7 +28,8 @@ QA_LEAD_BLOCK = """
 2. 开发期间：用 `run_smoke(taskId)` 预跑自查里程碑分支，把失败**当场**
    反馈给实现者（附复现步骤），不要攒到 submit 才说。
 3. 里程碑 submit：门禁自动跑冻结探针；FAIL 会拒收--你的职责是让实现者
-   在此之前已经见过这些失败。
+   在此之前已经见过这些失败。VERIFY 收口前核对 acceptanceCriteria 逐条
+   覆盖（verdict 证据引原文/编号或 `N/A: 理由`），缺条会被 submit 门拒。
 4. 测试面过大时：`hire_agent` 招叶子 QA（test_engineer），按验收清单分片
    派活（dispatch_task）；他们的装配级测试结论汇总进你的里程碑验收。
 

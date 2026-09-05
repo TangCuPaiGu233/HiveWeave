@@ -1664,6 +1664,17 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             },
         },
         "required": ["files"],
+            "filesChanged": {
+                "type": "array",
+                "aliases": ["files_changed", "files"],
+                "description": (
+                    "Optional: paths YOU reviewed in the assignee worktree. "
+                    "When provided, substitutes for the submission's empty/"
+                    "wrong evidence.files_changed in the worktree proof gate "
+                    "(e.g. pure-doc tasks) — instead of bouncing the task to "
+                    "re-submit formality fields."
+                ),
+            },
     },
     "cancel_task": {
         "description": (

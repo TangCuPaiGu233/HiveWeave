@@ -456,12 +456,15 @@ async def _submit_preflight(
                         "message": (
                             "A previous request_code_audit attempt ended "
                             "llm_failed — silent skip is no longer allowed "
-                            "(P0-3 fail-loud). Either retry "
-                            "request_code_audit until an attestation is "
-                            "issued, or have a coordinator run "
-                            "waive_attestation(taskId=\""
-                            f"{task_id}\", reason=\"audit unavailable\") — "
-                            "the waive is logged and expires in 24h."
+                            "(P0-3 fail-loud). This is NOT missing evidence "
+                            "on your side: the platform auto-enqueued a "
+                            "background retry and will notify you in your "
+                            "inbox when it succeeds — wait for that notice. "
+                            "Only if repeated auto-retries (5) still fail, "
+                            "have a coordinator run waive_attestation(taskId=\""
+                            f"{task_id}\", reason=\"audit unavailable\", "
+                            "reasonKind=\"tool_failure\") — a real human "
+                            "decision."
                         ),
                     })
     elif params.tests_passed is not True:
@@ -522,6 +525,33 @@ async def _submit_preflight(
             "task_id": task_id,
         }
 
+    # ── 门禁智能化包任务1/6：E1 verdict 门 + 验收清单覆盖 → 并入聚合预检 ──
+    # 服务层硬门保持不变（API 直提仍会被 services.tasks.submit 拒绝）；此处
+    # 用同一套判定函数提前算进「一次报全」回执，免去 verdict 问题逐轮撞门。
+    if is_verify:
+        from hiveweave.services.tasks.acceptance import (
+            format_acceptance_coverage_error,
+            uncovered_acceptance_items,
+        )
+        from hiveweave.services.tasks.verify import verdict_evidence_gaps
+
+        for _gap in verdict_evidence_gaps(evidence):
+            issues.append({
+                "code": "verdict_gate",
+                "message": (
+                    "E1 verdict gate: " + _gap + "。补齐后重新 submit_task"
+                    "（verdict ∈ {PASS, FAIL}；FAIL 还需非空 blockingIssues）。"
+                ),
+            })
+        _uncovered = uncovered_acceptance_items(
+            task.get("acceptance_criteria"), evidence
+        )
+        if _uncovered:
+            issues.append({
+                "code": "acceptance_coverage",
+                "message": format_acceptance_coverage_error(_uncovered),
+            })
+
     # P1-C/N5: code tasks require clean worktree + files_changed proof.
     tag_l = {
         str(t).strip().lower()
@@ -541,6 +571,7 @@ async def _submit_preflight(
 
         main_ws = await project_main_workspace(project_id)
         wt = await agent_worktree_path(agent_id)
+        dirty_count = 0
         if wt and main_ws:
             delivery = await effective_delivery(main_ws, wt)
             dirty_count = int(delivery.get("dirty_count") or 0)
@@ -620,6 +651,38 @@ async def _submit_preflight(
                         attestations=len(_aids),
                         error=_aerr,
                     )
+
+        # ── 门禁智能化包任务1①：files_changed 空（非 doc 类任务）─────────
+        # 此前空清单会一路走到 review 才被 compare_worktree_to_main 拒绝
+        # （42 轮实证 files_changed 空 3+3 次全在对面侧才爆）。这里只把缺口
+        # 提前并进聚合回执 + 给处方；有 verified attestation 时上方已自动盖
+        # no_code_change 旗标（verification-only 交付），不会进此分支。
+        # dirty>0 且无清单的场景已由上方 worktree_dirty_no_files 覆盖，不重复报。
+        # VERIFY 任务排除：其交付物是凭证/verdict 而非 diff（review 侧
+        # review_worktree_gate 对 VERIFY 本就整体跳过），不在此门拦截。
+        # worktree/MAIN 无法定位时不判（不可测量即不拦截，沿用旧契约）。
+        if (
+            not is_verify
+            and wt
+            and main_ws
+            and dirty_count == 0
+            and not evidence.get("files_changed")
+            and not evidence.get("no_code_change")
+        ):
+            issues.append({
+                "code": "files_changed_empty",
+                "message": (
+                    "submit_task rejected: files_changed 为空（非 "
+                    "docs/explore 类任务）。处方（三选一）："
+                    "1) 确有代码变更 → git_worktree_checkpoint 后重交"
+                    "（平台会从 worktree diff 自动回填清单）；"
+                    "2) 清单漏填 → submit_task(..., filesChanged=[...]) "
+                    "显式列出 worktree 中真实存在的文件；"
+                    "3) 本任务确无代码变更 → 带本任务的 verified "
+                    "attestationIds 重交（平台自动盖 no_code_change "
+                    "旗标），或打 docs/explore 标签。"
+                ),
+            })
 
     # P1-2: submit-time symmetric existence gate (mirrors approve-time
     # missing_claimed check). Catches "submit with no actual deliverable"
@@ -856,11 +919,12 @@ async def submit_task_tool(
             )
         if len(active) > 1:
             task_list = ", ".join(
-                f"{t['id'][:8]} ({t.get('title', '?')})" for t in active
+                f"{t['id']} ({t.get('title', '?')})" for t in active
             )
             return ToolResult.err(
                 f"Multiple active tasks found: {task_list}. "
-                "Please specify which taskId to submit."
+                "Please specify which taskId to submit "
+                "(full 36-char ids above — copy directly)."
             )
         task_id = active[0]["id"]
 
@@ -871,7 +935,8 @@ async def submit_task_tool(
     # B3: 归档任务写保护 —— 已归档任务不可提交
     if task.get("is_archived"):
         return ToolResult.err(
-            f"Task {task_id[:8]} is archived and cannot be submitted. "
+            f"Task {task.get('id') or task_id} is archived and cannot be "
+            "submitted (full id above — copy directly). "
             f"Use create_task or dispatch_task for new work."
         )
 
@@ -881,16 +946,16 @@ async def submit_task_tool(
     _st = (task.get("status") or "").lower()
     if _st == "approved":
         return ToolResult.err(
-            f"Task {task_id[:8]} is already APPROVED — submit is closed for "
-            "this round. The reviewer/creator will git_worktree_merge it. "
-            "Do NOT resubmit. If you have NEW changes that must be reviewed, "
-            "ask the reviewer to review_task(rework) first, or create a new "
-            "task referencing this one."
+            f"Task {task.get('id') or task_id} is already APPROVED — submit "
+            "is closed for this round. The reviewer/creator will "
+            "git_worktree_merge it. Do NOT resubmit. If you have NEW changes "
+            "that must be reviewed, ask the reviewer to review_task(rework) "
+            "first, or create a new task referencing this one."
         )
     if _st in ("closed", "cancelled"):
         return ToolResult.err(
-            f"Task {task_id[:8]} is {_st} (terminal) — it cannot be "
-            "submitted. Create a new task for further work."
+            f"Task {task.get('id') or task_id} is {_st} (terminal) — it "
+            "cannot be submitted. Create a new task for further work."
         )
 
     # B4: 只有 assignee 可以提交任务。creator==assignee 的自交任务
@@ -901,7 +966,7 @@ async def submit_task_tool(
     if task_assignee and str(task_assignee) != str(agent_id):
         return ToolResult.err(
             f"Only the assignee can submit this task. "
-            f"You are not the assignee (assignee={task_assignee[:8]}). "
+            f"You are not the assignee (assignee={task_assignee}). "
             f"If you are the creator, use review_task or dispatch_task instead."
         )
 
@@ -945,6 +1010,27 @@ async def submit_task_tool(
         return ToolResult.err(msg)
 
     evidence: dict[str, Any] = preflight["evidence"]
+
+    # ── 门禁智能化包任务4：verdict_claim_check（FAIL 主张机械复核）──────
+    # 只增事实位：结果附进 verdict 证据（evidence.claim_check）与提交回执，
+    # 供 reviewer 参考；绝不据此拒绝或翻转 verdict（红线）。
+    claim_check_lines: list[str] = []
+    if (
+        str(evidence.get("verdict") or "").upper() == "FAIL"
+        and evidence.get("blocking_issues")
+    ):
+        try:
+            from hiveweave.services.tasks.verdict_claim_check import (
+                format_claim_check_lines,
+                run_verdict_claim_check,
+            )
+
+            _checks = await run_verdict_claim_check(project_id, task, evidence)
+            if _checks:
+                evidence["claim_check"] = _checks
+                claim_check_lines = format_claim_check_lines(_checks)
+        except Exception as e:  # noqa: BLE001
+            log.debug("verdict_claim_check_failed", task_id=task_id, error=str(e))
 
     try:
         # Auto-transition: if task is in 'created' or 'claimed' status,
@@ -1034,7 +1120,14 @@ async def submit_task_tool(
             from hiveweave.agents.trigger import trigger_coordinator
             await trigger_coordinator(notify_id)
 
-        return ToolResult.ok(f"Task {task_id} submitted for review.{audit_reminder}")
+        receipt = f"Task {task_id} submitted for review.{audit_reminder}"
+        if claim_check_lines:
+            receipt += (
+                "\n[claim_check] blockingIssues 文件级主张机械复核"
+                "（事实位，不改变 verdict，仅供 reviewer 参考）：\n"
+                + "\n".join(claim_check_lines)
+            )
+        return ToolResult.ok(receipt)
     except Exception as e:
         return ToolResult.err(f"Failed to submit task: {e}")
 

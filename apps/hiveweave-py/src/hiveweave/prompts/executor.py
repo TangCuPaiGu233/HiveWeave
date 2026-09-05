@@ -112,6 +112,7 @@ def _test_engineer_script(name: str) -> str:
 - **不写应用代码**，只测试和报告（回归测试文件与一次性验证脚本除外——用完即删）
 - **只测 MAIN 上中层派来的完整里程碑切片**（标题 `VERIFY:` / `milestoneVerify`）。不要在叶子 worktree 跑全站 E2E，不要给中层审查闸「取证」。MAIN 上的测/浏览用 `bash_main` / `browse_main`，不要用 `bash`/`browse`（那是 worktree）。你有 worktree 只放脚本；MAIN 还没有该里程碑 = 还没轮到你，不是去叶子树找规格。
 - 连续 3 次失败则升级上报（send_message to superior）
+- VERIFY 任务带 `acceptanceCriteria` 时：verdict 证据须**逐条覆盖**（引用原文/编号，不适用写 `N/A: 理由`），缺条会被 submit 门点名拒。FAIL 的文件级主张（「X 缺 Y」）平台会机械复核（claim_check 事实位）——如实主张，别靠措辞过关。
 - 每个 pass/fail 必须有实际输出佐证
 - 长测试套件用 `bash_main(command=..., background=true)` 后 `commit_turn(phase=waiting)`（工具回执里的 `waiting_on`）；不要把全量 suite 嵌进本轮 LLM。Woken with `[BASH DONE]` / `[BASH FAILED]`。
 - **里程碑含 UI**：必须用 `browse_main` 开真实浏览器 — 单元测试通过 ≠ UI 通过

@@ -488,7 +488,16 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
 
     agent_id = topic.split(":", 1)[1]
     message = payload.get("message", "")
-    images = payload.get("images")
+    # 与 REST 路径（api/chat.py）对齐：用户消息可带图片。轻校验——
+    # list[str] 且非空才透传；坏载荷按无图处理，不让一张脏图炸掉整条消息。
+    raw_images = payload.get("images")
+    images = (
+        raw_images
+        if isinstance(raw_images, list)
+        and raw_images
+        and all(isinstance(i, str) for i in raw_images)
+        else None
+    )
 
     from hiveweave.services.chat_message import ChatMessageService
     from hiveweave.agents.supervisor import agent_manager
@@ -508,6 +517,7 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
                     "content": message,
                     "is_streaming": False,
                     "is_read": True,
+                    "images": images,
                     "metadata": {"source": "user"},
                 }
             )
@@ -606,6 +616,7 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
                 "role": "user",
                 "content": message,
                 "is_streaming": False,
+                "images": images,
                 "metadata": {"source": "user"},
             }
         )

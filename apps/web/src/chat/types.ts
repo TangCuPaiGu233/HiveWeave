@@ -19,7 +19,12 @@ export interface ToolCall {
 }
 
 /** 消息来源（metadata.source；legacy 消息由前端推断）。 */
-export type MessageSource = "user" | "agent" | "system" | "watchdog";
+export type MessageSource =
+  | "user"
+  | "agent"
+  | "agent_to_user"
+  | "system"
+  | "watchdog";
 
 /**
  * 上下文边界标记（后端 store.py 压缩/裁剪落地后发出）。

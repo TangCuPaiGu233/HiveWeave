@@ -361,7 +361,13 @@ export function inferMessageSource(
   m: any,
   meta: Record<string, any> | null,
 ): MessageSource | undefined {
-  if (meta?.source === "user" || meta?.source === "agent" || meta?.source === "system" || meta?.source === "watchdog") {
+  if (
+    meta?.source === "user" ||
+    meta?.source === "agent" ||
+    meta?.source === "agent_to_user" ||
+    meta?.source === "system" ||
+    meta?.source === "watchdog"
+  ) {
     return meta.source;
   }
   const from = meta?.from_agent_id ?? m.teamFromAgentId ?? m.team_from_agent_id;

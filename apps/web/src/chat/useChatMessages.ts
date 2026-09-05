@@ -29,6 +29,13 @@ type UpdateStreamDraft = (
  */
 const DONE_AFTER_IDLE_GRACE_MS = 8000;
 
+/**
+ * P2-2：force-settle（宽限兜底、gate 失败保留 persisted draft）之后的一次性
+ * 延迟复查间隔。给「落库慢 / swap 重试耗尽」的 turn 一个时间维度终审：
+ * 30s 后 segments 若已补落则换场，仍失败则放弃并不再排程（非轮询）。
+ */
+const SETTLE_RECHECK_DELAY_MS = 30_000;
+
 export function useChatMessages(opts: {
   agentId: string | null;
   streamDraft: StreamDraft | null;
@@ -273,6 +280,17 @@ export function useChatMessages(opts: {
               });
               // 本 handler 上方已为 parsed.id 建行，删掉旧 placeholder 行避免重 id。
               setMessages((prev) => prev.filter((m) => m.id !== oldId));
+            } else if (streamDraftRef.current.assistantId !== parsed.id) {
+              // 上一轮的残留 draft（done 丢失后由宽限/重连路径 persisted 收口
+              // 的）——新一轮的 message_id 到达即废弃重建。agent 单 turn 串行，
+              // 不同真实 id 的 message_id 只能是新 turn；不重置的话新 turn 的
+              // deltas 会叠进旧 id 的 draft（跨轮泄漏）。
+              updateStreamDraft({
+                assistantId: parsed.id,
+                segments: [],
+                isBackground,
+                startedAt: Date.now(),
+              });
             } else if (flag !== undefined) {
               updateStreamDraft((prev) => (prev ? { ...prev, isBackground: flag } : prev));
             }
@@ -390,6 +408,16 @@ export function useChatMessages(opts: {
         if (streamDraftRef.current) {
           settledRoundRef.current = streamDraftRef.current.assistantId;
         }
+        // done 一到立即把 draft 切到 persisted 形态（TEST_DSH_44 Bug#1）：
+        // isStreaming 翻 false 后，未 persisted 的 draft 会被
+        // mergeStreamDraftIntoMessages 忽略——收口重试窗口内就会露出底下
+        // 平铺的中途快照行。persisted draft 走同一结构化分支渲染，直到带
+        // metadata.segments 的权威快照落地换掉它。id 守卫（P2-1）：翻转只
+        // 打在本 done 对应的 turn 上，不碰新 turn 的 live draft。
+        const draftIdAtDone = streamDraftRef.current?.assistantId;
+        updateStreamDraft((prev) =>
+          prev && prev.assistantId === draftIdAtDone ? { ...prev, persisted: true } : prev
+        );
         // done 先于 draft 清空：结算本轮端到端耗时冻结到消息上，气泡头部
         // 据此显示 tok/s（tokens 分子用渲染时的估算，口径一致）。
         const finishedDraft = streamDraftRef.current;
@@ -401,7 +429,10 @@ export function useChatMessages(opts: {
         // fetch-then-swap（八轮收口竞态修复）：done 后只有当重载回来的消息
         // 带 metadata.segments（整轮块序列）才清 draft 换正式渲染；中途快照
         // 的 content 是旁白拼接平文本，拿它换 draft 会退化成「旁白总和」。
-        // 有界重试（5×400ms）兜底，超限按旧行为放行，UI 不可能卡死。
+        // 有界重试（5×400ms）兜底；超限**不清 draft**——persisted draft 已
+        // 是结构化 settle 渲染，清掉才是平铺坍缩（旧行为「放行」已删）。
+        // 后端一个 turn 有两次 done（streamer 收尾 + completion 落库后权威
+        // done），权威 done 会重新触发本流程完成收口。
         const swapDraftWhenReady = async (attempt = 0): Promise<void> => {
           if (activeAgentIdRef.current !== forAgentId) return; // 已切走，放弃
           const ok = await loadMessagesFromDb(forAgentId);
@@ -412,18 +443,25 @@ export function useChatMessages(opts: {
             window.setTimeout(() => void swapDraftWhenReady(attempt + 1), 400);
             return; // draft 留屏（流式整轮视图），等带分段的快照
           }
-          updateStreamDraft(null);
+          if (ready) {
+            // id 守卫：重试窗口内可能已有新 turn 的 draft 在飞（旧 swap
+            // 不得误清新 turn 的 live 视图）。
+            updateStreamDraft((prev) => (prev && prev.assistantId !== finishedId ? prev : null));
+          }
           if (genStats && finishedId) {
             setMessages((prev) =>
               prev.map((m) => (m.id === finishedId ? { ...m, _genStats: genStats } : m)),
             );
           }
+          // P1-1：被动订阅保留到 swap 终态——done#2（权威收口）必须还能进
+          // gate；在 done#1 就摘掉 handler 槽位的话，落库慢于重试窗口时
+          // done#2 被 ws 层丢弃，persisted draft 永远等不到权威快照换场。
+          releasePassiveStream(forAgentId);
         };
         void swapDraftWhenReady();
         setIsStreaming(false);
         updateProcessingAgent(forAgentId, false);
         delete savedDraftsRef.current[forAgentId];
-        releasePassiveStream(forAgentId);
         return;
       }
       if (event.type === "error") {
@@ -432,6 +470,15 @@ export function useChatMessages(opts: {
         if (streamDraftRef.current) {
           settledRoundRef.current = streamDraftRef.current.assistantId;
         }
+        // P1-2：与 done 同款 persisted 翻转——isStreaming 翻 false 后未
+        // persisted 的 draft 会被 mergeStreamDraftIntoMessages 早退忽略，
+        // 整轮结构化视图坍缩回平铺快照。错误收口的 DB 行没有 segments，
+        // 结构化 draft 就地 settle，下一轮 message_id 重建交接。
+        updateStreamDraft((prev) =>
+          prev && prev.assistantId === settledRoundRef.current
+            ? { ...prev, persisted: true }
+            : prev
+        );
         setIsStreaming(false);
         updateProcessingAgent(forAgentId, false);
         delete savedDraftsRef.current[forAgentId];
@@ -602,10 +649,59 @@ export function useChatMessages(opts: {
           void loadMessagesFromDb(graceForAgentId).then((ok) => {
             if (!ok) return;
             const latest = streamDraftRef.current;
-            if (latest && latest.assistantId === roundId) updateStreamDraft(null);
+            if (!latest || latest.assistantId !== roundId) return;
+            // 与 done 收口同 gate（TEST_DSH_44 Bug#1）：快照无
+            // metadata.segments 时不换（平铺坍缩），保留 persisted 结构化
+            // draft；带 segments 才清 draft 让 DB 权威行接管。
+            const rows =
+              (useAppStore.getState().chatSessions[graceForAgentId] as ChatMessage[] | undefined) ??
+              [];
+            if (settledMessageHasSegments(rows, roundId)) {
+              updateStreamDraft(null);
+            } else {
+              // 无 segments：保留 persisted 结构化 draft，并标记本 round 已
+              // 强制收口——否则宽限分支每个 processing 翻转都会重新武装 8s
+              // 定时器，形成 8s 一次的 DB 轮询。
+              settledRoundRef.current = roundId;
+              graceDeadlineRef.current = null;
+              updateStreamDraft((prev) =>
+                prev && prev.assistantId === roundId ? { ...prev, persisted: true } : prev
+              );
+              // P2-2：force-settle 后补一次性 30s 延迟复查——落库慢/重试
+              // 耗尽的 turn 其 metadata.segments 可能稍后补齐。再 gate 一次
+              // loadMessagesFromDb→swap；仍失败则放弃，不再排程（廉价终审，
+              // 不引入轮询）。
+              window.setTimeout(() => {
+                if (activeAgentIdRef.current !== graceForAgentId) return;
+                const pendingDraft = streamDraftRef.current;
+                if (!pendingDraft || pendingDraft.assistantId !== roundId) return;
+                void loadMessagesFromDb(graceForAgentId).then((ok2) => {
+                  if (!ok2) return;
+                  const latestNow = streamDraftRef.current;
+                  if (!latestNow || latestNow.assistantId !== roundId) return;
+                  const freshRows =
+                    (useAppStore.getState().chatSessions[graceForAgentId] as
+                      | ChatMessage[]
+                      | undefined) ?? [];
+                  if (settledMessageHasSegments(freshRows, roundId)) {
+                    updateStreamDraft((prev) =>
+                      prev && prev.assistantId !== roundId ? prev : null
+                    );
+                  }
+                  // 仍失败：放弃（一次性复查，不排程下一次）。
+                });
+              }, SETTLE_RECHECK_DELAY_MS);
+            }
           });
         }, remaining);
         return () => window.clearTimeout(timer);
+      }
+      if (draft) {
+        // P1-1：done 已收口、swap 尚在重试窗口（persisted draft 在屏）——
+        // 保留被动订阅，权威 done#2 必须还能进 gate；订阅由
+        // swapDraftWhenReady 的终态（ready 或耗尽）负责摘除。
+        graceDeadlineRef.current = null;
+        return;
       }
       graceDeadlineRef.current = null;
       const wasPassive = passiveSubRef.current === agentId;
@@ -657,15 +753,22 @@ export function useChatMessages(opts: {
       if (cancelled || !ok) return;
       const cur = streamDraftRef.current;
       if (!cur) return;
-      const row = useAppStore
-        .getState()
-        .chatSessions[id]?.find((m) => m.id === cur.assistantId);
+      const rows =
+        (useAppStore.getState().chatSessions[id] as ChatMessage[] | undefined) ?? [];
+      const row = rows.find((m) => m.id === cur.assistantId);
       const turnDoneInDb = !!row && !row.isStreaming;
       if (
         turnDoneInDb ||
         !useAppStore.getState().processingAgents.includes(id)
       ) {
-        updateStreamDraft(null);
+        // 与 done 收口同 gate（TEST_DSH_44 Bug#1）：重载快照无
+        // metadata.segments 时不清 draft（会退回平铺中途快照），改切
+        // persisted 形态按结构化整轮视图 settle；带 segments 的快照才让位。
+        if (settledMessageHasSegments(rows, cur.assistantId)) {
+          updateStreamDraft(null);
+        } else {
+          updateStreamDraft((prev) => (prev ? { ...prev, persisted: true } : prev));
+        }
       }
     });
     return () => {

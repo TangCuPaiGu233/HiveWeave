@@ -11,7 +11,7 @@ import { streamChat, joinAgentChannel, pushInsert } from "../api";
 import { mergeDeltaContent } from "../utils/mergeDelta";
 import { useAppStore } from "../store";
 import type { ChatMessage, StreamDraft } from "./types";
-import { appendToolCallSegment, applyToolResult, beginStreamRound, parseToolUsePayload } from "./messageUtils";
+import { appendToolCallSegment, applyToolResult, beginStreamRound, parseToolUsePayload, settledMessageHasSegments } from "./messageUtils";
 
 type UpdateStreamDraft = (
   updater: StreamDraft | null | ((prev: StreamDraft | null) => StreamDraft | null)
@@ -253,7 +253,14 @@ export function useChatSend(opts: {
       (event) => {
         if (!isActiveSession()) return;
         if (event.type === "round_start") {
-          updateStreamDraft((prev) => (prev ? beginStreamRound(prev) : prev));
+          // round 号由 ws 层放在 data（0 起轮号，字符串）——交给
+          // beginStreamRound 插入轮次分隔（首轮/缺号 no-op）。与被动路径
+          // （useChatMessages）同款解析；此前主动流漏传轮号，用户发起的
+          // turn live 阶段永远没有轮次分隔（B6 live==persisted 缺口）。
+          const roundNum = parseInt(event.data, 10);
+          updateStreamDraft((prev) =>
+            prev ? beginStreamRound(prev, Number.isFinite(roundNum) ? roundNum : undefined) : prev
+          );
           return;
         }
         if (event.type === "message_id") {
@@ -505,20 +512,6 @@ export function useChatSend(opts: {
             "hire_agent",
           ]);
           if ([...allToolsUsed].some((x) => ORG_TOOLS.has(x))) refreshOrgTree();
-          const draftContent =
-            streamDraftRef.current?.segments
-              ?.filter((s) => s.type === "text" || s.type === "thinking")
-              ?.map((s) => s.content || "")
-              ?.join("") || "";
-          if (draftContent) {
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.isStreaming && m.role === "assistant" && !m.content
-                  ? { ...m, content: draftContent }
-                  : m
-              )
-            );
-          }
           // done 先于 draft 清空：结算本轮端到端耗时冻结到消息（与被动订阅
           // 路径 useChatMessages 的 done 结算同款）。DB 重载后由
           // loadMessagesFromDb 按 id 携带，会话内持续显示 tok/s。
@@ -528,19 +521,46 @@ export function useChatSend(opts: {
               ? { ms: Math.max(1, Date.now() - finishedDraft.startedAt) }
               : null;
           const finishedId = finishedDraft?.assistantId;
-          loadMessagesFromDb(sendingForAgentId).then((ok) => {
-            if (ok) {
-              updateStreamDraft(null);
-            } else {
-              updateStreamDraft((prev) => (prev ? { ...prev, persisted: true } : prev));
+          // done 一到立即把 draft 切到 persisted 形态：isStreaming 翻 false 后
+          // 未 persisted 的 draft 会被 mergeStreamDraftIntoMessages 忽略（退回
+          // 平铺的中途快照行）——收口重试窗口内必须继续按结构化 draft 渲染，
+          // 直到带 metadata.segments 的权威快照落地换掉它。id 守卫（P2-1）：
+          // 翻转只打在本 done 对应的 turn 上，不碰新 turn 的 live draft。
+          updateStreamDraft((prev) =>
+            prev && prev.assistantId === finishedId ? { ...prev, persisted: true } : prev
+          );
+          // fetch-then-swap gate（TEST_DSH_44 Bug#1，与被动路径
+          // useChatMessages.swapDraftWhenReady 同款）：后端一个 turn 有两次
+          // done——streamer 收尾 done（core.py stream finally，早于
+          // handle_completion 落库 metadata.segments）+ completion 落库后的
+          // 权威 done。第一次到达时 DB 里还是中途快照（content=旁白拼接、
+          // 无 segments），直接清 draft 会把整轮结构化渲染坍缩成平铺文本。
+          // 只有重载回来的消息带 segments 才清 draft；gate 失败保留
+          // persisted draft（结构化 settle 渲染），权威 done / 重试完成收口。
+          const swapDraftWhenReady = async (attempt = 0): Promise<void> => {
+            if (activeAgentIdRef.current !== sendingForAgentId) return; // 已切走，放弃
+            const ok = await loadMessagesFromDb(sendingForAgentId);
+            const sessionMsgs =
+              (useAppStore.getState().chatSessions[sendingForAgentId] as ChatMessage[] | undefined) ??
+              [];
+            const ready = ok && settledMessageHasSegments(sessionMsgs, finishedId);
+            if (!ready && attempt < 4) {
+              window.setTimeout(() => void swapDraftWhenReady(attempt + 1), 400);
+              return; // draft 留屏（结构化整轮视图），等带分段的权威快照
+            }
+            if (ready) {
+              // id 守卫：重试窗口内可能已有新 turn 的 draft 在飞（旧 swap
+              // 不得误清新 turn 的 live 视图）。
+              updateStreamDraft((prev) => (prev && prev.assistantId !== finishedId ? prev : null));
             }
             if (genStats && finishedId) {
               setMessages((prev) =>
                 prev.map((m) => (m.id === finishedId ? { ...m, _genStats: genStats } : m)),
               );
             }
-            setIsStreaming(false);
-          });
+          };
+          void swapDraftWhenReady();
+          setIsStreaming(false);
           releaseLockAndFinish();
         } else if (event.type === "busy") {
           setThinkingElapsed(null);
@@ -568,11 +588,23 @@ export function useChatSend(opts: {
           }
           setRetryInfo(null);
           if (sendingForAgentId) updateProcessingAgent(sendingForAgentId, false);
+          // 与 done 同款 gate（TEST_DSH_44 Bug#1）：错误收口的 DB 行
+          // （[对话被中断]/部分旁白）没有 metadata.segments——清 draft 换平铺
+          // 行会把流式期间可见的工具行/思考段坍缩。gate 失败保留 persisted
+          // draft（结构化），下一 turn 的 message_id 重建 draft 自然交接。
+          // erroredId 在入口捕获：fetch 往返间 draft 可能已换成新 turn 的。
+          const erroredId = streamDraftRef.current?.assistantId;
           loadMessagesFromDb(sendingForAgentId).then((ok) => {
-            if (ok) {
-              updateStreamDraft(null);
+            const sessionMsgs =
+              (useAppStore.getState().chatSessions[sendingForAgentId] as ChatMessage[] | undefined) ??
+              [];
+            const hasSegments = ok && settledMessageHasSegments(sessionMsgs, erroredId);
+            if (hasSegments) {
+              updateStreamDraft((prev) => (prev && prev.assistantId !== erroredId ? prev : null));
             } else {
-              updateStreamDraft((prev) => (prev ? { ...prev, persisted: true } : prev));
+              updateStreamDraft((prev) =>
+                prev && prev.assistantId === erroredId ? { ...prev, persisted: true } : prev
+              );
             }
             setIsStreaming(false);
           });

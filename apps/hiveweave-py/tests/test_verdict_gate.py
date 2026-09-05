@@ -375,7 +375,9 @@ async def _mk_verify_running_for(ts: TaskService, pid: str, agent: str) -> str:
 async def test_fail_submit_rejected_when_assignee_degraded(task_env):
     """E5-④降级中提交 verdict=FAIL → 硬拒（禁止就地收口），状态不推进。"""
     from hiveweave.agents.recovery import clear_degraded, mark_degraded
+    from hiveweave.services import rejection_memory as rm
 
+    rm.reset_for_tests()  # 连拒计数是进程级，测试间隔离
     ts = TaskService()
     pid = task_env["project_id"]
     vid = await _mk_verify_running_for(ts, pid, EXEC)
@@ -390,6 +392,7 @@ async def test_fail_submit_rejected_when_assignee_degraded(task_env):
         assert "degraded" in str(ei.value)
     finally:
         clear_degraded(EXEC)
+        rm.reset_for_tests()
     # transition 之前拦截 → 状态未被推进
     assert (await ts.get_task(pid, vid))["status"] == "running"
 
@@ -410,3 +413,36 @@ async def test_pass_submit_allowed_when_assignee_degraded(task_env):
     finally:
         clear_degraded(EXEC)
     assert (await ts.get_task(pid, vid))["status"] == "submitted"
+
+# ── 45 轮 P1「拒绝无记忆」：降级终验拒带 RETRY 标记 + 连拒标注 ──────
+
+
+@pytest.mark.asyncio
+async def test_degraded_fail_rejection_carries_marker_and_repeat(task_env):
+    """首次拒带 RETRY 出路标记；第二连拒追加 REPEAT REJECTION 事实位。"""
+    from hiveweave.agents.recovery import clear_degraded, mark_degraded
+    from hiveweave.services import rejection_memory as rm
+
+    rm.reset_for_tests()
+    ts = TaskService()
+    pid = task_env["project_id"]
+    vid = await _mk_verify_running_for(ts, pid, EXEC)
+    mark_degraded(EXEC)
+    try:
+        texts = []
+        for _ in range(2):
+            with pytest.raises(ValueError) as ei:
+                await ts.submit_task(
+                    pid,
+                    vid,
+                    evidence={
+                        "verdict": "FAIL",
+                        "blocking_issues": ["/_admin 404"],
+                    },
+                )
+            texts.append(str(ei.value))
+        assert "RETRY[action=resume_turn_then_resubmit" in texts[0]
+        assert "[REPEAT REJECTION #2 via submit_task]" in texts[1]
+    finally:
+        clear_degraded(EXEC)
+        rm.reset_for_tests()

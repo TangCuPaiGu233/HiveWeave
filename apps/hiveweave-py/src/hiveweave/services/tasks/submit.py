@@ -65,12 +65,25 @@ class SubmitMixin:
                 and normalize_verdict(evidence.get("verdict")) == "FAIL"
                 and self._is_degraded_assignee(task)
             ):
-                raise ValueError(
+                # 45 轮 P1「拒绝无记忆」①②：machine-readable 出路标记 +
+                # 同因连拒计数（45 轮降级终验 3 连拒同文案）。
+                from hiveweave.services.rejection_memory import (
+                    annotate_repeat_rejection,
+                )
+
+                msg = (
                     "SUBMIT REJECTED (degraded verify): 你所在 turn 刚被断流/"
                     "打断（降级中）且正提交 FAIL 终验——禁止就地收口。可执行"
                     "两步：① 续跑完成这一轮（正常完成一轮后平台自动清除降级"
-                    "标志），完成重新验证后再提交；② 或显式升级 coordinator/CEO。"
+                    "标志），完成重新验证后再提交；② 或显式升级 coordinator/"
+                    "CEO。 RETRY[action=resume_turn_then_resubmit|"
+                    "alt=escalate_coordinator]"
                 )
+                msg += annotate_repeat_rejection(
+                    "submit_task", msg,
+                    agent_id=str(task.get("assignee_id") or "") or None,
+                )
+                raise ValueError(msg)
 
         # SUBMITTED MACHINE PRE-RUN (slice-driven L0)
         if task and task.get("contract_json"):

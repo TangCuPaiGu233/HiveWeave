@@ -614,6 +614,36 @@ class ToolLoopMixin:
             )
 
             if round_result["status"] == "error":
+                # 45 轮 P1：断流/超时轮已收到的部分 usage 保账——此前随
+                # 异常丢弃（budget_cut 返回路径有保，raise 路径没有），
+                # SSL 风暴期这批丢失正好集中在要归因的重试窗口。
+                partial = round_result.get("partial_usage")
+                if partial:
+                    try:
+                        p_usage = self._normalize_usage(
+                            partial, provider.provider_type
+                        )
+                        if p_usage:
+                            if not p_usage.get("duration_ms"):
+                                p_usage["duration_ms"] = int(
+                                    round_result.get("round_duration_ms") or 0
+                                )
+                            p_usage["ts"] = int(time.time() * 1000)
+                            p_usage["partial"] = True
+                            usage_rounds.append(p_usage)
+                            if usage_sink is not None:
+                                try:
+                                    usage_sink(p_usage)
+                                except Exception:
+                                    log.warning(
+                                        "usage_sink_failed", agent_id=agent_id
+                                    )
+                    except Exception:
+                        log.warning(
+                            "partial_usage_normalize_skipped",
+                            agent_id=agent_id,
+                            round=round_num,
+                        )
                 return {
                     "status": "error",
                     "content": text_acc or "",

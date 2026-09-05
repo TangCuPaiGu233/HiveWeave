@@ -317,6 +317,8 @@ class HttpStreamMixin:
                 # Preserve for agent-level quota park (TEST20 P0-B)
                 "error_status": e.status,
                 "error_headers": dict(e.headers or {}),
+                # 45 轮 P1：断流 raise 前已收的部分 usage（保账）
+                "partial_usage": getattr(e, "partial_usage", None),
             }
         except PermanentError as e:
             # 不可重试错误（401/400 等）→ 不报告熔断器
@@ -362,6 +364,7 @@ class HttpStreamMixin:
                         "error": str(se),
                         "error_status": se.status,
                         "error_headers": dict(se.headers or {}),
+                        "partial_usage": getattr(se, "partial_usage", None),
                     }
                 except PermanentError as se:
                     # 剥图后仍失败（非图像类 400/401 等）→ 归一化返回，不再剥图递归。
@@ -373,6 +376,7 @@ class HttpStreamMixin:
                         "finish_reason": None,
                         "error": str(se),
                         "error_status": se.status,
+                        "partial_usage": getattr(se, "partial_usage", None),
                     }
             return {
                 "status": "error",
@@ -382,6 +386,7 @@ class HttpStreamMixin:
                 "finish_reason": None,
                 "error": str(e),
                 "error_status": e.status,
+                "partial_usage": getattr(e, "partial_usage", None),
             }
 
     # ── 实际流式 HTTP 请求（线程池 + 同步 httpx）────────────────
@@ -656,10 +661,19 @@ class HttpStreamMixin:
                             error=error_content,
                         )
                         raise classify_http_error(None, error_content)
-        except BaseException:
+        except BaseException as e:
             if not abandon_executor:
                 abandon_executor = True
                 _close_http_client()
+            # 45 轮 P1：断流/超时 raise 路径保住已收 usage（budget_cut
+            # 返回路径此前已保，raise 路径随异常丢弃）——挂异常对象，由
+            # _stream_single_round 的错误收口带出、tool_loop 并入账本。
+            if usage:
+                try:
+                    # setattr 形式保 mypy 基线（BaseException 无该属性声明）
+                    setattr(e, "partial_usage", dict(usage))
+                except Exception:
+                    pass
             raise
         finally:
             if abandon_executor:

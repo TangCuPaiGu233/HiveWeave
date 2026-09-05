@@ -282,13 +282,27 @@ async def commit_turn_tool(
                             steps += format_unreplied_ask_reject_suffix(
                                 ask_bits
                             )
-                        return ToolResult.err(
+                        # 45 轮 P1「拒绝无记忆」①②：machine-readable 出路
+                        # 标记 + 同因连拒计数（45 轮账本拒 2×/50 秒同文案）。
+                        from hiveweave.services.rejection_memory import (
+                            annotate_repeat_rejection,
+                        )
+
+                        msg = (
                             f"commit_turn REJECTED (synchronous gate): "
                             + steps
                             + soft_note
                             + ". 请按上述步骤处理这些义务再 commit_turn，"
                             "或改用 phase=in_progress 继续工作。"
-                            + f" gates: {hard}.",
+                            + f" gates: {hard}."
+                            + " RETRY[action=process_obligations_then_commit"
+                            "|alt=continue_in_progress]"
+                        )
+                        msg += annotate_repeat_rejection(
+                            "commit_turn", msg, agent_id=agent_id
+                        )
+                        return ToolResult.err(
+                            msg,
                             gates=list(hard),
                             actions={
                                 c: gate_actions.get(c, "")

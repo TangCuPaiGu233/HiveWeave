@@ -17,6 +17,14 @@
 逐行量程位（42 轮 P2-9）：llm_usage.creation_unreported=1 表示该行
 provider 未回传 cache 写入（0 是「无数据」），0 = 上游真回传（含真 0）；
 行数不足 MIN_CACHE_HIT_SAMPLE_ROWS 时聚合命中率输出「样本不足」而非数值。
+
+记账覆盖率口径（45 轮 P2 观察，2026-09-06 文档化）: ``llm_usage 行数 /
+agent_runs.actual_llm_calls`` 可**合法地大于 100%**（45 轮实测
+115.64%/109.27%）——子代理的 usage round 归父账（record_rounds 带
+request_type="subagent"、落父 run），而 agent_runs 的 actual_llm_calls
+只按子代理自身 run 计数；多代理并行时分子含跨 run 归属行、分母是各 run
+自报调用数，口径不同不可当「漏账/重账」判据用。覆盖率判据（R9）只用于
+下界检查（<50% = 账本断裂），上界无意义。
 """
 
 from __future__ import annotations

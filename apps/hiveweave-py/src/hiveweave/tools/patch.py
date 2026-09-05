@@ -14,7 +14,11 @@ from typing import Any
 
 import structlog
 
-from hiveweave.tools.file import _resolve_safe_detail
+from hiveweave.tools.file import (
+    _resolve_safe_detail,
+    check_file_version,
+    record_file_version,
+)
 from hiveweave.util.tree_label import write_tree_suffix
 from hiveweave.tools.security import check_sensitive_access
 
@@ -166,6 +170,7 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
             p.write_text(content, encoding="utf-8")
         except OSError as exc:
             return f"ERROR: {exc}"
+        record_file_version(p)
         size = len(content.encode("utf-8"))
         return f"Created {file_path} ({size} bytes)"
 
@@ -179,6 +184,16 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
             return f"ERROR: File not found: {file_path}"
         if not p.is_file():
             return f"ERROR: Not a file: {file_path}"
+        # 45 轮 P1「拒绝无记忆」③：edit 前版本戳——文件在最近一次读/写
+        # 访问后被外部改动 → 陈旧视图早拒（逼重读），而不是烧在
+        # oldString not found 上。
+        stale = check_file_version(p)
+        if stale:
+            return (
+                f"ERROR: stale view: {file_path} changed since your last "
+                f"read ({stale}). Re-read the file, then re-apply. "
+                "RETRY[action=reread_file_then_reapply]"
+            )
         try:
             content = p.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
@@ -194,6 +209,7 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
                 p.write_text(new_content, encoding="utf-8")
             except OSError as exc:
                 return f"ERROR: {exc}"
+            record_file_version(p)
             return (f"Updated {file_path} ({count} occurrences replaced, "
                     f"replace_all=True)")
 
@@ -212,13 +228,25 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
                     p.write_text(new_content, encoding="utf-8")
                 except OSError as exc:
                     return f"ERROR: {exc}"
+                record_file_version(p)
                 old_lines = old_str.count("\n") + 1
                 new_lines = new_str.count("\n") + 1
                 line_diff = new_lines - old_lines
                 sign = "+" if line_diff >= 0 else ""
                 return (f"Updated {file_path} ({sign}{line_diff} lines, fuzzy match)")
-            return (f"ERROR: oldString not found in {file_path}. "
-                    "Please read the file first.")
+            # 45 轮 P1：machine-readable 出路标记 + 同因连拒计数（s3c10
+            # 同文件 4 败夹 3 成的陈旧视图形态）。
+            from hiveweave.services.rejection_memory import (
+                annotate_repeat_rejection,
+            )
+
+            msg = (
+                f"ERROR: oldString not found in {file_path}. "
+                "Please read the file first."
+                " RETRY[action=reread_file_then_reapply|alt=use_write_file]"
+            )
+            msg += annotate_repeat_rejection("edit_file", msg)
+            return msg
         if count > 1:
             return (f"ERROR: oldString found {count} times in {file_path}. "
                     "Add more context to make it unique.")
@@ -228,6 +256,7 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
             p.write_text(new_content, encoding="utf-8")
         except OSError as exc:
             return f"ERROR: {exc}"
+        record_file_version(p)
 
         old_lines = old_str.count("\n") + 1
         new_lines = new_str.count("\n") + 1

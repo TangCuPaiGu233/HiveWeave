@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,53 @@ from hiveweave.util.tree_label import (
 )
 
 log = structlog.get_logger(__name__)
+
+# ── 文件版本戳（45 轮 P1「拒绝无记忆」③）───────────────────────────
+# 记录本进程内最近一次成功 read/write 访问后的 (mtime_ns, size)；patch 的
+# update op 写盘前比对——文件在最近访问后被外部（git 同步/其他 agent/平台
+# 工具）改过 → 陈旧视图早拒逼重读。进程内即可：陈旧窗口是 turn 级的。
+# 键是进程级路径（非 per-agent）：A 读 → B 写 → A edit 的场景 B 的写已
+# 刷新戳，A 仍会漏判——已知的精度换简（audit P3-1），edit 本身对新读内容
+# 锚定不会写坏。
+_version_lock = threading.Lock()
+_VERSION_CACHE_CAP = 4096
+_version_cache: dict[str, tuple[int, int]] = {}
+
+
+def record_file_version(path: str | Path) -> None:
+    """登记一次成功访问后的文件版本（stat 失败静默跳过）。"""
+    try:
+        st = Path(path).stat()
+        key = str(Path(path).resolve())
+        cur = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return
+    with _version_lock:
+        if len(_version_cache) >= _VERSION_CACHE_CAP and key not in _version_cache:
+            # 插入序淘汰最旧一半（dict 保插入序；audit P2-2 防无界增长）
+            for k in list(_version_cache)[: _VERSION_CACHE_CAP // 2]:
+                del _version_cache[k]
+        _version_cache[key] = cur
+
+
+def check_file_version(path: str | Path) -> str | None:
+    """返回「已变」描述；无历史记录或未变化返回 None。"""
+    try:
+        st = Path(path).stat()
+        key = str(Path(path).resolve())
+        cur = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    with _version_lock:
+        known = _version_cache.get(key)
+    if known is None or known == cur:
+        return None
+    return f"size {known[1]}B → {cur[1]}B since your last access"
+
+
+def clear_file_versions_for_tests() -> None:
+    with _version_lock:
+        _version_cache.clear()
 
 # ── Constants ───────────────────────────────────────────────
 
@@ -557,6 +605,7 @@ async def read_file(
     suffix = f"\n\n(Showing lines {start + 1}-{end} of {total})"
     if truncated_note:
         suffix = truncated_note + suffix
+    record_file_version(full)
     return {"success": True, "output": body + suffix, "error": None}
 
 
@@ -604,6 +653,7 @@ async def write_file(
 
     size = len(content.encode("utf-8"))
     log.info("file.write", path=file_path, bytes=size)
+    record_file_version(p)
     return {"success": True,
             "output": (
                 f"Wrote {file_path} ({size} bytes)"

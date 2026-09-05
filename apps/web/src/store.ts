@@ -104,11 +104,6 @@ interface AppState {
   setPendingApprovals: (agentId: string, approvals: PendingApproval[]) => void;
   setAllPendingApprovals: (approvals: PendingApproval[]) => void;
   removeApproval: (requestId: string) => void;
-  // Add agent dialog
-  showAddAgent: boolean;
-  addAgentParentId: string | null;
-  openAddAgent: (parentId?: string | null) => void;
-  closeAddAgent: () => void;
   // Runtime processing status — which agents are currently processing (LLM/API activity)
   processingAgents: string[];
   setProcessingAgents: (ids: string[]) => void;
@@ -306,11 +301,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return { pendingApprovals: newApprovals };
     }),
-  // Add agent dialog
-  showAddAgent: false,
-  addAgentParentId: null,
-  openAddAgent: (parentId) => set({ showAddAgent: true, addAgentParentId: parentId || null }),
-  closeAddAgent: () => set({ showAddAgent: false, addAgentParentId: null }),
   // Runtime processing status
   processingAgents: [],
   setProcessingAgents: (ids) => set((state) => {

@@ -208,14 +208,6 @@ export async function getAgentsLiveStatus(projectId: string): Promise<AgentLiveS
   }
 }
 
-export async function createAgent(data: any) {
-  return fetchJSON(`${BASE}/org/agents`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-}
-
 export async function updateAgent(id: string, data: any) {
   return fetchJSON(`${BASE}/org/agents/${id}`, {
     method: "PATCH",
@@ -698,42 +690,6 @@ export async function saveImageGenConfig(input: {
     payload[IMAGE_GEN_KEYS.apiKey] = nextKey;
   }
   await updateSettings(payload);
-}
-
-// ---------------------------------------------------------------------------
-// Agent Templates
-// ---------------------------------------------------------------------------
-
-export interface AgentTemplate {
-  id: string;
-  source: string;
-  division: string;
-  name: string;
-  role: string;
-  color: string;
-  emoji: string;
-  vibe: string;
-  description: string;
-  promptBody: string;
-  originalFile: string;
-  createdAt: number;
-}
-
-export async function getTemplates(opts?: { division?: string; role?: string; source?: string }): Promise<AgentTemplate[]> {
-  const params = new URLSearchParams();
-  if (opts?.division) params.set("division", opts.division);
-  if (opts?.role) params.set("role", opts.role);
-  if (opts?.source) params.set("source", opts.source);
-  const qs = params.toString();
-  return fetchJSON(`${BASE}/agent-templates${qs ? "?" + qs : ""}`);
-}
-
-export async function getTemplateDivisions(): Promise<string[]> {
-  return fetchJSON(`${BASE}/agent-templates/divisions`);
-}
-
-export async function getTemplate(id: string): Promise<AgentTemplate> {
-  return fetchJSON(`${BASE}/agent-templates/${id}`);
 }
 
 // ---------------------------------------------------------------------------

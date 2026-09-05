@@ -14,7 +14,6 @@ const WorkLogPanel = lazyRetry(() => import("./components/WorkLogPanel"));
 const AgentDetailPanel = lazyRetry(() => import("./components/AgentDetailPanel"));
 const MonitorPanel = lazyRetry(() => import("./components/MonitorPanel"));
 const DebugPanel = lazyRetry(() => import("./components/DebugPanel"));
-const AddAgentDialog = lazyRetry(() => import("./components/AddAgentDialog"));
 const FolderPicker = lazyRetry(() => import("./components/FolderPicker"));
 const OfficeView = lazyRetry(() => import("./components/OfficeView"));
 const ModelConfigPage = lazyRetry(() => import("./components/ModelConfigPage"));
@@ -41,10 +40,6 @@ function App() {
   const selectedProjectId = useAppStore((s) => s.selectedProjectId);
   const setSelectedProjectId = useAppStore((s) => s.setSelectedProjectId);
   const socketReconnectVersion = useAppStore((s) => s.socketReconnectVersion);
-  const showAddAgent = useAppStore((s) => s.showAddAgent);
-  const addAgentParentId = useAppStore((s) => s.addAgentParentId);
-  const openAddAgent = useAppStore((s) => s.openAddAgent);
-  const closeAddAgent = useAppStore((s) => s.closeAddAgent);
   const activeView = useAppStore((s) => s.activeView);
   const setActiveView = useAppStore((s) => s.setActiveView);
   const rightPanelTab = useAppStore((s) => s.rightPanelTab);
@@ -702,19 +697,6 @@ function App() {
                 <span>{projectStarting ? "处理中..." : currentProject?.isStarted ? "上班中" : "已下班"}</span>
               </button>
             )}
-
-            {selectedProjectId && activeView === "tree" && (
-              <button
-                onClick={() => openAddAgent(null)}
-                className="flex items-center gap-1 px-2.5 py-1 text-xs text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg rounded-gm transition-all active:scale-95"
-                title="Create Agent"
-              >
-                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-                </svg>
-                Agent
-              </button>
-            )}
           </div>
           <div className="flex-1 overflow-hidden bg-app-tint">
             <div key={activeView} className="hw-tab-in h-full">
@@ -860,18 +842,6 @@ function App() {
 
       {/* Lazy-loaded dialogs — wrapped in Suspense, fallback=null since they're overlays */}
       <Suspense fallback={null}>
-        {showAddAgent && selectedProjectId && (
-          <AddAgentDialog
-            projectId={selectedProjectId}
-            parentId={addAgentParentId}
-            onClose={closeAddAgent}
-            onCreated={() => {
-              closeAddAgent();
-              refreshOrgTree();
-            }}
-          />
-        )}
-
         {showFolderPicker && (
           <FolderPicker
             initialPath={folderPickerInitialPath}

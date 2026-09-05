@@ -358,14 +358,13 @@ const LIVE_PHASE_STYLE: Record<NonNullable<AgentLiveStatus["phase"]>, string> = 
 };
 
 function TreeNodeCard({
-  node, isSelected, onSelect, onAddChild, onApproval, onToggle,
+  node, isSelected, onSelect, onApproval, onToggle,
   expanded, pendingCount, hasUserPing, isProcessing, nodeH, alarm,
   healthError, live,
 }: {
   node: LayoutNode;
   isSelected: boolean;
   onSelect: (id: string) => void;
-  onAddChild: (parentId: string) => void;
   onApproval: (id: string) => void;
   onToggle: () => void;
   expanded: boolean;
@@ -542,20 +541,6 @@ function TreeNodeCard({
           </span>
         )}
       </div>
-
-      {/* Add child — absolutely positioned, does NOT affect row layout */}
-      <span
-        onClick={(e) => { e.stopPropagation(); onAddChild(node.id); }}
-        className="absolute bottom-1 right-1 rounded-md hidden group-hover:flex items-center justify-center text-g-fg-4 hover:text-g-blue hover:bg-g-blue/10 transition-colors"
-        style={{ width: compact ? 14 : 16, height: compact ? 14 : 16 }}
-      >
-        <svg
-          className={compact ? "w-2 h-2" : "w-2.5 h-2.5"}
-          fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}
-        >
-          <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-        </svg>
-      </span>
     </div>
   );
 }
@@ -621,7 +606,6 @@ function OrgTree() {
   const selectedAgentId = useAppStore((s) => s.selectedAgentId);
   const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
   const setRightPanelTab = useAppStore((s) => s.setRightPanelTab);
-  const openAddAgent = useAppStore((s) => s.openAddAgent);
   const pendingApprovals = useAppStore((s) => s.pendingApprovals);
   const userPingAgentIds = useAppStore((s) => s.userPingAgentIds);
   const processingAgents = useAppStore((s) => s.processingAgents);
@@ -1091,7 +1075,6 @@ function OrgTree() {
                     node={n}
                     isSelected={selectedAgentId === n.id}
                     onSelect={handleSelect}
-                    onAddChild={openAddAgent}
                     onApproval={(id) => setApprovalAgentId(id)}
                     live={liveMap[n.id]?.phase && liveMap[n.id].phase !== "idle" ? liveMap[n.id] : undefined}
                     onToggle={() => {

@@ -26,8 +26,6 @@ describe('useAppStore', () => {
       selectedProjectId: null,
       apiKey: null,
       pendingApprovals: {},
-      showAddAgent: false,
-      addAgentParentId: null,
       processingAgents: [],
       agentDispositions: {},
       userPingAgentIds: [],
@@ -186,24 +184,6 @@ describe('useAppStore', () => {
     removeApproval('r2')
     expect(useAppStore.getState().pendingApprovals['a1']).toHaveLength(0)
     expect(useAppStore.getState().pendingApprovals['a2']).toHaveLength(1)
-  })
-
-  it('openAddAgent / closeAddAgent 控制对话框状态', () => {
-    useAppStore.getState().openAddAgent('parent-1')
-    let s = useAppStore.getState()
-    expect(s.showAddAgent).toBe(true)
-    expect(s.addAgentParentId).toBe('parent-1')
-
-    // 无参数调用 openAddAgent → parentId 为 null
-    useAppStore.getState().openAddAgent()
-    s = useAppStore.getState()
-    expect(s.showAddAgent).toBe(true)
-    expect(s.addAgentParentId).toBeNull()
-
-    useAppStore.getState().closeAddAgent()
-    s = useAppStore.getState()
-    expect(s.showAddAgent).toBe(false)
-    expect(s.addAgentParentId).toBeNull()
   })
 
   it('setProcessingAgents 全量替换；updateProcessingAgent 增删单个 agent', () => {

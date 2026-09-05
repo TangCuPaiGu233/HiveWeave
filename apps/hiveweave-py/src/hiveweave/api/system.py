@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 import structlog
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -143,6 +143,33 @@ async def restart_frontend() -> dict:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/code-drift")
+async def code_drift_status() -> dict:
+    """F14 源码指纹漂移快照（只读：进程内存启动指纹 vs 磁盘当前指纹）。
+
+    返回 ``{drift, checked_at, changed_count, changed_files}``（changed_files
+    截前 20 条）。数据全部取自 services.code_fingerprint.code_drift() 现有
+    API，不做新计算、无副作用。指纹未初始化（理论上不会——lifespan 启动
+    即记录）时 code_drift() fail-open 返回 drift=False + reason，本端点照
+    200 透出，不 503（观测端点不该比被观测对象更脆）。
+    """
+    from datetime import datetime, timezone
+
+    from hiveweave.services.code_fingerprint import code_drift
+
+    d = code_drift()
+    changed = list(d.get("changed_files") or [])
+    return {
+        "drift": bool(d.get("drift")),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "changed_count": len(changed),
+        "changed_files": changed[:20],
+        "reason": str(d.get("reason") or ""),
+        "startup": d.get("startup"),
+        "current": d.get("current"),
+    }
+
+
 @router.get("/acl-sandbox-stats")
 async def acl_sandbox_stats() -> dict:
     """ACL 沙箱遥测快照（spec §13 P1/P3：fail-closed/拒绝命中/传播/mint P95）。
@@ -157,3 +184,25 @@ async def acl_sandbox_stats() -> dict:
     stats["active"] = acl_sandbox_active()
     stats["sentinel_last"] = sentinel_last()
     return stats
+
+
+@router.get("/verify-efficiency")
+async def verify_efficiency(
+    project_id: str = Query(..., description="Project id"),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    """VERIFY 时长比监控（只读）：最近 N 个 closed VERIFY 任务的
+    总时长 / 有效验证时长 比值报告。
+
+    口径见 docs/2026-09-05/verify-efficiency-metric.md；纯只读，
+    不改变任何任务行为/门禁。项目不存在时 404。
+    """
+    from hiveweave.db.project import ProjectDbError
+    from hiveweave.services.tasks.verify_efficiency import (
+        verify_efficiency_report,
+    )
+
+    try:
+        return await verify_efficiency_report(project_id, limit=limit)
+    except ProjectDbError as e:
+        raise HTTPException(status_code=404, detail=str(e))

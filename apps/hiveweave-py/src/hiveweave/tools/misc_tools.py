@@ -13,9 +13,13 @@ Tools:
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import html as html_mod
 import ipaddress
+import os
 import re
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -1579,8 +1583,9 @@ class MessageUserParams(BaseModel):
         default=None,
         description=(
             "Optional images shown to the user together with the message "
-            "(效果效果图/截图). Each item is base64 or a data URL; max 5 "
-            "images, each up to ~2MB."
+            "(效果图/截图). Each item is a data URL, an http(s):// image "
+            "URL, or a screenshot path under .hiveweave/reports/ (平台自动"
+            "读取内联，无需自己转 base64); max 5 images, each up to ~2MB."
         ),
         json_schema_extra={"aliases": ["image", "picture", "screenshot"]},
     )
@@ -1597,45 +1602,194 @@ class MessageUserParams(BaseModel):
 _MESSAGE_USER_MAX_IMAGES = 5
 _MESSAGE_USER_MAX_IMAGE_CHARS = 2_800_000
 
+# 报告截图直传（2026-09-05）：CEO 无 bash/SOURCE_WRITE（硬门），无法自己把
+# 验收截图转 base64 —— images 允许直接传项目 `.hiveweave/reports/` 下的截图
+# 路径，平台读文件转 data URL 内联（与既有 data URL 同形态，前端零改动）。
+_MESSAGE_USER_REPORT_PREFIX = ".hiveweave/reports/"
+_MESSAGE_USER_REPORT_IMAGE_EXTS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp",
+})
+_MESSAGE_USER_REPORT_EXT_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+# 2MiB 二进制 base64 后 ~2.80M chars，恰好收在单张字符上限内。
+_MESSAGE_USER_REPORT_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _message_user_reports_root(ctx: Any, workspace: str) -> Path | None:
+    """定位项目 ``.hiveweave/reports/``（验收截图的宿主目录）。
+
+    优先 ctx.extra.project_root（executor 注入），回退 infer_project_root
+    （剥离 worktree 前缀 —— reports 落在 MAIN 项目根，不在叶子 worktree）。
+    定位失败 → None，报告路径条目走 fail-closed 白名单拒绝。
+    """
+    project_root: Any = None
+    extra = getattr(ctx, "extra", None)
+    if isinstance(extra, dict):
+        project_root = extra.get("project_root")
+    if not project_root:
+        try:
+            from hiveweave.tools.file import infer_project_root
+
+            project_root = infer_project_root(workspace or "")
+        except Exception:
+            return None
+    root = str(project_root or "").strip()
+    if not root:
+        return None
+    return Path(root) / ".hiveweave" / "reports"
+
+
+def _normcase_inside(child: str, base: str) -> bool:
+    """``child`` 是否落在 ``base`` 内（normcase 宽松，Windows 大小写/分隔符）。"""
+    c = os.path.normcase(os.path.normpath(child))
+    b = os.path.normcase(os.path.normpath(base))
+    if c == b:
+        return True
+    if not b.endswith(os.sep):
+        b += os.sep
+    return c.startswith(b)
+
+
+def _report_image_error(i: int, problem: str, raw: str) -> str:
+    """报告截图路径解析/读取失败 —— fail-closed 报错附处方，不静默丢图。"""
+    return (
+        f"message_user rejected: images[{i}] {problem}（收到：{raw}）。"
+        "处方：确认路径在项目 .hiveweave/reports/ 下、指向已生成的截图"
+        "（browse 取证保存后才可引用），后缀限 .png/.jpg/.jpeg/.gif/.webp；"
+        "或改用 data:image/… / http(s)://… 图片串。"
+    )
+
+
+def _resolve_report_image_path(
+    reports_root: Path, raw: str
+) -> tuple[Path | None, str | None]:
+    """把 images 条目解析为 reports 内的图片文件；返回 (path, err)。
+
+    接受两种形态：``.hiveweave/reports/…`` 项目根相对路径，或规范化后仍
+    落在 reports 内的绝对路径。防逃逸双确认：① normpath 字符串前缀校验
+    （含 ``..`` 直接拒）；② resolve() 展开符号链接后再次前缀校验。
+    返回 (None, None) 表示「不是报告路径形态」，交回白名单拒绝分支。
+    """
+    p = raw.replace("\\", "/")
+    if ".." in p.split("/"):
+        return None, "路径不得包含 '..'（防穿越）"
+    from hiveweave.tools.file import normalize_input_path
+
+    p = normalize_input_path(p)
+    if Path(p).is_absolute():
+        if not _normcase_inside(p, str(reports_root)):
+            return None, None  # reports 外绝对路径 → 白名单拒绝分支
+        candidate = Path(p)
+    else:
+        s = p
+        while s.startswith("./"):
+            s = s[2:]
+        if not s.lower().startswith(_MESSAGE_USER_REPORT_PREFIX):
+            return None, None  # 非报告路径形态 → 白名单拒绝分支
+        candidate = reports_root / s[len(_MESSAGE_USER_REPORT_PREFIX):]
+        # 注意：remainder 带盘符/UNC 时 pathlib 会整体替换（构造即越界），
+        # 真正的兜底是下方 resolve 展开后的二次前缀校验——勿删。
+    try:
+        resolved = candidate.resolve()
+        resolved_root = reports_root.resolve()
+    except OSError:
+        return None, "路径无法解析"
+    if not _normcase_inside(str(resolved), str(resolved_root)):
+        return None, "符号链接展开后越出 .hiveweave/reports/（防逃逸）"
+    if candidate.suffix.lower() not in _MESSAGE_USER_REPORT_IMAGE_EXTS:
+        return None, "不是图片文件"
+    return candidate, None
+
+
+def _read_report_image_data_url(path: Path) -> tuple[str | None, str | None]:
+    """读报告截图并转 data URL（≤2MiB；to_thread 读防阻塞事件循环）。"""
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return None, "截图文件不存在"
+    except OSError:
+        return None, "截图文件不可访问"
+    if size > _MESSAGE_USER_REPORT_MAX_BYTES:
+        return None, (
+            f"截图超过单张 ~2MB 上限（{size} bytes），请压缩或降分辨率后重试"
+        )
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None, "截图文件读取失败"
+    mime = _MESSAGE_USER_REPORT_EXT_MIME.get(path.suffix.lower(), "image/png")
+    b64 = base64.b64encode(data).decode("ascii")
+    # stat→read 之间文件可增长（browse 正在写截图是常态）：读后二次限幅。
+    if len(b64) > _MESSAGE_USER_MAX_IMAGE_CHARS:
+        return None, (
+            f"截图超过单张 ~2MB 上限（base64 {len(b64)} chars），"
+            "请压缩或降分辨率后重试"
+        )
+    return f"data:{mime};base64,{b64}", None
+
 
 def _validate_message_user_images(
     images: list[str],
-) -> str | None:
-    """校验 images 参数；返回错误文案（含处方）或 None（合法）。"""
+    reports_root: Path | None = None,
+) -> tuple[list[str], str | None]:
+    """校验并解析 images 参数；返回 (落库 images, 错误文案或 None)。
+
+    - data:image/… 与 http(s)://… 原样保留（既有前缀白名单）。
+    - `.hiveweave/reports/` 下的截图路径：平台读文件转 data URL 内联
+      （与既有 data URL 同形态，前端零改动）。解析/读取失败 → 报错附
+      处方（fail-closed，绝不静默丢图）。
+    """
     if len(images) > _MESSAGE_USER_MAX_IMAGES:
-        return (
+        return [], (
             f"message_user rejected: images 超过 {_MESSAGE_USER_MAX_IMAGES} 张上限"
             f"（收到 {len(images)} 张）。处方：压缩合并图片，或减少张数、"
             "分多条 message_user 发送。"
         )
+    resolved: list[str] = []
     for i, img in enumerate(images, 1):
         if not isinstance(img, str) or not img.strip():
-            return (
+            return [], (
                 f"message_user rejected: images[{i}] 必须是非空字符串"
-                "（data:image/ 开头的 data URL，或 http(s):// 图片 URL）。"
+                "（data:image/ 开头的 data URL、http(s):// 图片 URL，"
+                "或 .hiveweave/reports/ 下的截图路径）。"
             )
-        # 备注②（审计 2026-09-05）：前缀白名单 —— 只收 data:image/ 或
-        # http(s):// 开头的串；裸 base64 缺 mime 头前端 <img> 渲染不出，
-        # 本地路径/文本则完全是噪音。
-        low = img.strip().lower()
-        if not (
-            low.startswith("data:image/")
-            or low.startswith("http://")
-            or low.startswith("https://")
-        ):
-            return (
-                f"message_user rejected: images[{i}] 不是可渲染的图片串"
-                "（仅接受 data:image/… 或 http(s)://… 开头）。处方：裸 base64 "
-                "请补前缀成 data:image/<格式>;base64,<数据>；本地文件请先读出"
-                "转 base64，或提供可访问的图片 URL。"
-            )
-        if len(img) > _MESSAGE_USER_MAX_IMAGE_CHARS:
-            return (
-                f"message_user rejected: images[{i}] 超过单张 ~2MB 软上限"
-                f"（{len(img)} chars）。处方：压缩或降分辨率后重发，"
-                "或减少张数分多条发送。"
-            )
-    return None
+        raw = img.strip()
+        low = raw.lower()
+        if low.startswith(("data:image/", "http://", "https://")):
+            if len(raw) > _MESSAGE_USER_MAX_IMAGE_CHARS:
+                return [], (
+                    f"message_user rejected: images[{i}] 超过单张 ~2MB 软上限"
+                    f"（{len(raw)} chars）。处方：压缩或降分辨率后重发，"
+                    "或减少张数分多条发送。"
+                )
+            resolved.append(raw)
+            continue
+        if reports_root is not None:
+            path, perr = _resolve_report_image_path(reports_root, raw)
+            if path is not None:
+                data_url, rerr = _read_report_image_data_url(path)
+                if data_url is not None:
+                    resolved.append(data_url)
+                    continue
+                return [], _report_image_error(i, rerr or "截图读取失败", raw)
+            if perr is not None:
+                return [], _report_image_error(i, perr, raw)
+        # 备注②（审计 2026-09-05）：前缀白名单 —— 只收 data:image/ /
+        # http(s):// / .hiveweave/reports/ 截图路径三种；裸 base64 缺 mime
+        # 头前端 <img> 渲染不出，reports 外本地路径/文本则完全是噪音。
+        return [], (
+            f"message_user rejected: images[{i}] 不是可渲染的图片串"
+            "（仅接受 data:image/…、http(s)://… 或 .hiveweave/reports/ 下的"
+            "截图路径）。处方：裸 base64 请补前缀成 data:image/<格式>;base64,"
+            "<数据>；验收截图可直接传 .hiveweave/reports/ 下的路径（平台自动"
+            "内联），或提供可访问的图片 URL。"
+        )
+    return resolved, None
 
 
 # E4 补（复盘 P0-1 G4「CEO 出口核验」）：完结断言词表——CEO 发布这些措辞
@@ -1765,9 +1919,16 @@ async def message_user_tool(
 
     # 件3（agent→用户发图 2026-09-05）：可选 images 校验（≤5 张、单张
     # ~2MB 软上限），超限报错并附处方（压缩/降张数）。
+    # 报告截图直传（2026-09-05）：`.hiveweave/reports/` 下截图路径在此处
+    # 由平台读文件转 data URL 内联（CEO 无 bash/SOURCE_WRITE，转不了 base64）。
     images = params.images or []
     if images:
-        images_err = _validate_message_user_images(images)
+        # 报告截图读文件+b64 最坏 ~10MiB 同步 IO：to_thread 防阻塞事件循环。
+        images, images_err = await asyncio.to_thread(
+            _validate_message_user_images,
+            images,
+            _message_user_reports_root(ctx, workspace),
+        )
         if images_err:
             return ToolResult.err(images_err)
 

@@ -1995,9 +1995,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "items": {"type": "string"},
                 "description": (
                     "Optional. Images shown to the user with the message "
-                    "(效果图/截图). Each item is base64 or a data URL; max 5 "
-                    "images, each up to ~2MB — compress or split into more "
-                    "messages if larger."
+                    "(效果图/截图). Each item is a data URL, an http(s):// "
+                    "image URL, or a screenshot path under .hiveweave/reports/ "
+                    "（可传 .hiveweave/reports/ 下的验收截图路径，平台自动内联 "
+                    "— 无需自己转 base64）. Max 5 images, each up to ~2MB — "
+                    "compress or split into more messages if larger."
                 ),
             },
         },

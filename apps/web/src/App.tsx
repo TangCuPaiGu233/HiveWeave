@@ -614,17 +614,17 @@ function App() {
             className="text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg/60 rounded-full p-1.5 transition-all active:scale-90"
             title="API Key 设置"
           >
-            <svg className="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a4 4 0 11-8 0 4 4 0 018 0zM12 15v6m-3-3h6" />
             </svg>
           </button>
-          {/* MCP 服务器管理 */}
+          {/* 设置面板（无人值守 / MCP 服务器） */}
           <button
             onClick={() => setShowMcpPanel(true)}
             className="text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg/60 rounded-full p-1.5 transition-all active:scale-90"
-            title="MCP 服务器"
+            title="设置"
           >
-            <svg className="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
             </svg>
           </button>

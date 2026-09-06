@@ -1757,6 +1757,44 @@ async def get_project_game_time(project_id: str) -> dict:
     }
 
 
+
+
+async def _inject_kr_progress(project_id: str, goals: dict) -> dict:
+    """46/11 批次 G：为 keyResults 附加任务进度（设计稿 §Q2 推导）。
+
+    每个 KR 若绑定了 taskIds，查询这些任务的 status 并计算
+    progress: {bound, approved, closed}。best-effort：查询失败不阻塞。
+    """
+    krs = goals.get("keyResults")
+    if not isinstance(krs, list):
+        return goals
+    all_tids = set()
+    for kr in krs:
+        if isinstance(kr, dict):
+            all_tids.update(str(t) for t in (kr.get("taskIds") or []))
+    if not all_tids:
+        return goals
+    try:
+        from hiveweave.db.project import query as _pq
+        tid_list = list(all_tids)
+        ph = ",".join("?" * len(tid_list))
+        rows = await _pq(project_id,
+                         f"SELECT id, status FROM tasks WHERE id IN ({ph})",
+                         tid_list)
+        status_map = {r["id"]: r["status"] for r in rows}
+    except Exception:
+        return goals
+    for kr in krs:
+        if not isinstance(kr, dict):
+            continue
+        tids = kr.get("taskIds") or []
+        if not tids:
+            continue
+        closed = sum(1 for t in tids if status_map.get(t) in ("approved", "closed"))
+        kr["progress"] = {"bound": len(tids), "approved": closed}
+    return goals
+
+
 @router.get("/{project_id}/goals")
 async def get_project_goals(project_id: str) -> dict:
     """读取 charter goals 段。
@@ -1788,6 +1826,7 @@ async def get_project_goals(project_id: str) -> dict:
         try:
             goals = json.loads(goals_raw) if isinstance(goals_raw, str) else goals_raw
             if isinstance(goals, dict) and goals:
+                goals = await _inject_kr_progress(project_id, goals)
                 return {"goals": goals, "projectId": project_id}
         except (json.JSONDecodeError, TypeError):
             pass

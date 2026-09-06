@@ -268,15 +268,19 @@ class CharterService:
     # ── Helpers ───────────────────────────────────────────────
 
     def _normalize_kr(self, kr: Any) -> dict:
-        """Normalize a key_result to {text, status, owner} object."""
+        """Normalize a key_result to {text, status, owner, taskIds?} object."""
         if isinstance(kr, str):
             return {"text": kr, "status": "doing", "owner": None}
         if isinstance(kr, dict):
-            return {
+            result = {
                 "text": kr.get("text", ""),
                 "status": kr.get("status", "doing"),
                 "owner": kr.get("owner"),
             }
+            tids = kr.get("taskIds") or kr.get("task_ids")
+            if isinstance(tids, list) and tids:
+                result["taskIds"] = [str(t) for t in tids if t]
+            return result
         return {"text": str(kr), "status": "doing", "owner": None}
 
     def _format_charter(self, d: dict) -> str:

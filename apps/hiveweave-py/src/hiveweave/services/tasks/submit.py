@@ -68,7 +68,7 @@ class SubmitMixin:
                 # 45 轮 P1「拒绝无记忆」①②：machine-readable 出路标记 +
                 # 同因连拒计数（45 轮降级终验 3 连拒同文案）。
                 from hiveweave.services.rejection_memory import (
-                    annotate_repeat_rejection,
+                    annotate_repeat_rejection, rejection_count,
                 )
 
                 msg = (
@@ -83,6 +83,36 @@ class SubmitMixin:
                     "submit_task", msg,
                     agent_id=str(task.get("assignee_id") or "") or None,
                 )
+                # 46/11 #8 平台动作：第 2 次连拒时自动把 VERIFY 回队
+                # running——QA 获得 fresh turn 重验再提交，不再卡死在
+                # 「提交→拒→提交」循环（356min 项目 8 连拒烧 VERIFY 的
+                # 实证解法；文案教育已证无效，改为平台代动作）。
+                repeat_n = rejection_count(
+                    msg, agent_id=str(task.get("assignee_id") or "") or None
+                )
+                if repeat_n >= 2:
+                    try:
+                        # submitted→running 是 _TRANSITIONS 合法迁移；
+                        # assignee 保持原 QA（duty 不变），fresh turn 解除
+                        # 降级后即可重验。
+                        await self._transition(
+                            project_id, task_id, "running",
+                            actor_id="system",
+                            reason_code="degraded_verify_auto_requeue",
+                        )
+                        log.info(
+                            "degraded_verify_auto_requeued",
+                            project_id=project_id,
+                            task_id=task_id,
+                            repeat_n=repeat_n,
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "degraded_verify_requeue_failed",
+                            project_id=project_id,
+                            task_id=task_id,
+                            error=str(e),
+                        )
                 raise ValueError(msg)
 
         # SUBMITTED MACHINE PRE-RUN (slice-driven L0)

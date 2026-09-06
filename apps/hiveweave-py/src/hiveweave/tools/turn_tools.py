@@ -101,7 +101,7 @@ class CommitTurnParams(BaseModel):
             "Required for waiting/blocked. "
             "Items: {kind: agent|task|user|timer|external, ref: str, note?: str}"
         ),
-        json_schema_extra={"aliases": ["waitingOn", "waiting_on"]},
+        json_schema_extra={"aliases": ["waitingOn", "waiting_on", "waitingon"]},
     )
     result: dict[str, Any] | None = Field(
         default=None,
@@ -116,6 +116,23 @@ class CommitTurnParams(BaseModel):
             "archived and recalled for future tasks."
         ),
     )
+
+    @field_validator("waiting_on", mode="before")
+    @classmethod
+    def _normalize_waiting_on(cls, v: Any) -> Any:
+        """46 轮 #3 根治：大小写×类型双坑在入口归一。
+
+        LLM 常发 ``waitingOn: "task-id"``（字符串）或小写 ``waitingon``——
+        schema 要 list[dict]，旧路径直接报 "valid list" 不点名病因。归一：
+        单字符串 → 单条 task 等待；dict 补成单元素列表。归一失败才原样
+        交给 pydantic 报错（错误文案由既有路径给）。
+        """
+        if isinstance(v, str):
+            ref = v.strip()
+            return [{"kind": "task", "ref": ref}] if ref else None
+        if isinstance(v, dict):
+            return [v]
+        return v
 
 
 @tool(

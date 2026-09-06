@@ -504,51 +504,79 @@ async def lifespan(app: FastAPI):
         log.warning("lifecycle_hooks_register_failed", error=str(e))
 
     # 2. Clear zombie streaming messages
+    # 批次A 启动提速 B：per-project 清扫并行化（重启后全员下班 Bug K，
+    # 清扫窗口无 agent 活动；每项目独立 per-project DB 文件无共享写锁）。
+    # N=52 时串行 ~52s 是启动绑口慢的主因之一。
     try:
         from hiveweave.db import meta as meta_db
-        from hiveweave.db.project import ensure_project_db
+        from hiveweave.db.project import ensure_project_db, execute_by_project
         projects = await meta_db.query("SELECT id, workspace_path FROM projects WHERE 1=1")
-        for p in projects:
-            try:
-                conn = await ensure_project_db(p["workspace_path"])
-                svc = ChatMessageService(p["id"])
-                await svc.clear_stuck_streaming()
-            except Exception as e:
-                log.warning("zombie_clear_failed", project_id=p["id"], error=str(e))
-        log.info("zombie_streaming_cleared", projects=len(projects))
+        zombie_sem = asyncio.Semaphore(8)
+        zombie_failed: list[str] = []
+
+        async def _clear_zombie(p: dict) -> None:
+            async with zombie_sem:
+                try:
+                    # 审计 M3：ChatMessageService.clear_stuck_streaming 内部
+                    # 自做全项目循环（N 调用=N² 语句）——这里直接项目域 UPDATE
+                    await execute_by_project(
+                        p["id"],
+                        "UPDATE chat_messages SET is_streaming = 0, "
+                        "content = CASE "
+                        "  WHEN content IS NULL OR TRIM(content) = '' "
+                        "  THEN '[对话被中断]' ELSE content END "
+                        "WHERE is_streaming = 1",
+                    )
+                except Exception as e:
+                    zombie_failed.append(p["id"])
+                    log.warning("zombie_clear_failed", project_id=p["id"], error=str(e))
+
+        await asyncio.gather(*[_clear_zombie(p) for p in projects])
+        log.info("zombie_streaming_cleared", projects=len(projects),
+                 failed=len(zombie_failed))
     except Exception as e:
         log.warning("zombie_streaming_clear_failed", error=str(e))
 
     # 2a. E16 (复盘 P2): 数据卫生 —— 启动收尾 sweep，清算上次进程残留的
     # status='running' agent_runs 孤儿行（归并为 interrupted，语义同既有
-    # interrupt_run，供恢复/审计读取）。
+    # interrupt_run，供恢复/审计读取）。批次A：并行化（同 §2 依据）。
     try:
         from hiveweave.services.run_ledger import sweep_stale_agent_runs
 
         projects = await meta_db.query("SELECT id, workspace_path FROM projects WHERE 1=1")
+        sweep_sem = asyncio.Semaphore(8)
         swept = 0
-        for p in projects:
-            swept += await sweep_stale_agent_runs(p["workspace_path"])
+
+        async def _sweep_runs(p: dict) -> None:
+            nonlocal swept
+            async with sweep_sem:
+                n = await sweep_stale_agent_runs(p["workspace_path"])
+                swept += n  # await 后再累加（审计 M4：并发读改写丢计数）
+
+        await asyncio.gather(*[_sweep_runs(p) for p in projects])
         if swept:
             log.info("stale_agent_runs_swept", count=swept)
     except Exception as e:
         log.warning("stale_agent_runs_sweep_failed", error=str(e))
 
     # 2b. R12 fix: 清理过期工具输出临时文件（7 天保留期）
+    # 批次A：纯文件系统操作 → to_thread 并行（同 §2 依据）。
     try:
         from hiveweave.tools.executor import ToolExecutor
         projects = await meta_db.query("SELECT id, workspace_path FROM projects WHERE 1=1")
+        clean_sem = asyncio.Semaphore(8)
         cleaned = 0
-        for p in projects:
-            try:
+
+        async def _clean_outputs(p: dict) -> None:
+            nonlocal cleaned
+            async with clean_sem:
                 # R13 fix: p 是 aiosqlite.Row，不支持 .get()，改用 [] 索引
-                # （查询显式 SELECT workspace_path，列一定存在；NULL 时返回 None）
                 ws = p["workspace_path"]
                 if ws:
-                    ToolExecutor.cleanup_tool_outputs(ws)
+                    await asyncio.to_thread(ToolExecutor.cleanup_tool_outputs, ws)
                     cleaned += 1
-            except Exception as e:
-                log.warning("tool_output_cleanup_failed", project_id=p["id"], error=str(e))
+
+        await asyncio.gather(*[_clean_outputs(p) for p in projects])
         log.info("tool_outputs_cleaned", projects=cleaned)
     except Exception as e:
         log.warning("tool_output_cleanup_init_failed", error=str(e))

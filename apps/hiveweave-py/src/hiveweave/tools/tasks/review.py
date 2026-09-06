@@ -28,16 +28,17 @@ _RACE_RETRY_WINDOW_SECONDS = 5
 
 
 def _race_fact_bit(task: dict | None) -> str:
-    """race 拒绝附事实位：该任务提交于 X 秒前，预计 N 秒内可审。"""
+    """race 拒绝附事实位：只陈述实测年龄，不做时长承诺（46 轮 #9——
+    模板写死 "~Ns 可审" 与实测 378s 自相矛盾，误导等待时长）。"""
     submitted_at = (task or {}).get("submitted_at")
     if submitted_at:
         try:
             age_s = max(0.0, (time.time() * 1000 - int(submitted_at)) / 1000.0)
             return (
-                f"Fact: this task was submitted {age_s:.0f}s ago; it should "
-                f"become reviewable within ~{_RACE_RETRY_WINDOW_SECONDS}s "
-                f"(submit lands, then the state re-checks after "
-                f"{_RACE_RECHECK_SLEEP_SECONDS}s)."
+                f"Fact: this task was submitted {age_s:.0f}s ago and the "
+                f"submit is still landing (state will flip to 'reviewing' "
+                f"once persistence catches up). Re-check the task state "
+                f"before deciding — do not act on the stale state."
             )
         except (TypeError, ValueError):
             pass
@@ -661,6 +662,23 @@ async def review_task_tool(
                     f"Task must be 'submitted', 'reviewing', or 'approved' "
                     f"to rework, but is '{current_status}'"
                 )
+        # 46 轮 #12：rework 空 feedback 是评审通道形式空转——实现者收到
+        # 「No specific feedback provided」无从改起，意见靠并行 ask 人肉
+        # 补传两轮。缺意见在此硬拒（verdict 闸的强制返修走
+        # decision=approve 的 forced_rework 路径，附 blocking_issues，
+        # 不受此限）。
+        if (
+            decision == "rework"
+            and not (params.feedback or "").strip()
+        ):
+            return ToolResult.err(
+                "REWORK REJECTED (feedback_absent): rework without specific "
+                "feedback is a no-op for the assignee — they cannot act on "
+                "'needs rework' alone. State WHAT fails and HOW to verify "
+                "the fix (file:line, expected vs actual, or the spec clause "
+                "violated). Fact bit: feedback_absent=true. "
+                "RETRY[action=restate_feedback_then_rework]"
+            )
         await ts.review_task(
             project_id, params.task_id, decision, params.feedback,
             reviewer_id=agent_id,

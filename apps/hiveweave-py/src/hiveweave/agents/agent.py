@@ -36,6 +36,7 @@ from hiveweave.llm.retry import (
     MAX_DELAY_MS,
     RetryableError,
     classify_http_error,
+    compute_backoff,
     parse_retry_after_ms,
     should_retry_exception,
 )
@@ -102,6 +103,30 @@ from hiveweave.agents import streaming as _agent_streaming
 from hiveweave.agents import watcher as _agent_watcher
 from hiveweave.agents import completion as _agent_completion
 from hiveweave.agents import recovery as _agent_recovery
+
+
+#: 上游/环境类 stream error 关键字（46 轮 #2 主循环边界重试用；与
+#: tools/subagent._UPSTREAM_FAILURE_KEYWORDS 同源词汇，刻意不共享导入——
+#: agents 层不依赖 tools 层私有符号）。
+_MAIN_LOOP_UPSTREAM_KEYWORDS = (
+    "stream idle", "ssl", "eof", "connection", "connect",
+    "timed out", "timeout", "reset by peer", "broken pipe",
+)
+
+
+def _is_upstream_stream_error(error_text: str, error_status: int | None = None) -> bool:
+    """status=error 的 result 是否属上游/环境瞬断（可原样重试）。"""
+    if error_status is not None:
+        try:
+            es = int(error_status)
+        except (TypeError, ValueError):
+            es = None
+        if es is not None and es in {429, 500, 502, 503, 504, 529}:
+            return True
+    text = (error_text or "").strip().lower()
+    if not text:
+        return False
+    return any(k in text for k in _MAIN_LOOP_UPSTREAM_KEYWORDS)
 
 
 def _unwrap_user_envelope(message: str) -> str:
@@ -1273,6 +1298,10 @@ class Agent:
 
             # 空响应重试循环
             current_messages = list(messages)
+            # 46 轮 #2：上游类 stream error（75s idle / SSL EOF）主循环
+            # 边界重试——每 turn 一次（子代理侧同款语义，批次 1 已落）。
+            # 46/11 实测主循环 idle 死亡 3+8 run / 68min error run。
+            self._main_upstream_retried = False
             while True:
                 # Unified activation budget check — stop before exceeding limits
                 _run_id = getattr(self, "_current_run_id", None)
@@ -1375,6 +1404,35 @@ class Agent:
                     )
 
                 status = result.get("status", "error")
+
+                # 46 轮 #2：上游类 stream error → 主循环边界重试一次
+                # （退避后重建 messages 原样重跑；与子代理 attempt 循环
+                # 同语义。仅 status=error 且分类=upstream；HTTP 429/5xx
+                # 仍走下方既有路径——llm/retry.py 已在 HTTP 层处理过）。
+                if (
+                    status == "error"
+                    and result.get("error_status") is None
+                    and not self._main_upstream_retried
+                ):
+                    # error_status 为 None：流内判死（idle/EOF）而非 HTTP 码——
+                    # 429/5xx 有专属治理路径（quota park/熔断），勿被此缝截胡
+                    err_text = str(result.get("error") or "")
+                    if _is_upstream_stream_error(err_text):
+                        self._main_upstream_retried = True
+                        from hiveweave.llm.retry import compute_backoff
+
+                        delay_s = compute_backoff(1) / 1000.0
+                        log.warning(
+                            "main_loop_stream_retry",
+                            agent_id=self.id,
+                            delay_s=round(delay_s, 2),
+                            upstream_error=err_text[:160],
+                        )
+                        await asyncio.sleep(delay_s)
+                        current_messages = await self._build_messages(
+                            message, opts
+                        )
+                        continue
 
                 if status == "empty":
                     # 空响应处理

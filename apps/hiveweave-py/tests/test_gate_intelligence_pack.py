@@ -4,7 +4,7 @@
 - 任务1 submit 聚合预检一次报全（attestation 门 + files_changed_empty +
   verdict_gate / acceptance_coverage 并进同一回执，不再逐轮撞门）
 - 任务2 回执全文 UUID（拒绝/回执文案输出完整 36 位 id）
-- 任务3 review/submit race 事实位（提交于 X 秒前，预计 ~5s 内可审）
+- 任务3 review/submit race 事实位（提交于 X 秒前；46 轮 #9 去掉时长承诺）
 - 任务4 verdict_claim_check：blockingIssues 文件级主张机械复核
   verified / refuted / skipped 三例 + 只附事实位不拒绝
 - 任务5 doc_review 分档（全文档放行 / 缺失拒 / 代码任务不进分档）+
@@ -353,11 +353,12 @@ async def test_archived_receipt_carries_full_uuid(env):
 
 
 def test_race_fact_bit_seconds():
+    # 46 轮 #9：模板写死 "~5s 可审" 与实测 378s 自相矛盾 → 改为只报实测
+    # 年龄，不做时长承诺（处方仍留在主文案 WAIT a few seconds）。
     task = {"submitted_at": int(time.time() * 1000) - 12_000}
     bit = _race_fact_bit(task)
     assert "12s ago" in bit, bit
-    assert "~5s" in bit, bit
-    # 处方保持不变（WAIT a few seconds and retry 在主文案里，事实位只补秒数）
+    assert "~5s" not in bit, bit
     assert "submitted" in bit
 
 

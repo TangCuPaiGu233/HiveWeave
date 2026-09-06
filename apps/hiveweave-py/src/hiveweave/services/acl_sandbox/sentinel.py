@@ -137,29 +137,36 @@ async def run_probe_all_projects() -> dict:
 
     sandbox_mode=danger-full-access（逃生门）的项目跳过 —— 其命令走 native，
     探针必然 None/假阳性，不判接线回归（P3 §9）。
+    批次A 启动提速 B：项目间并行（信号量 4——探针走真实沙箱入口，受限
+    令牌 spawn 是成本大头；结果聚合顺序无关，fail 日志按项目记）。
     """
+    import asyncio
+
     from hiveweave.db.meta import query
     from hiveweave.services.acl_sandbox.integration import project_sandbox_mode
 
     rows = await query("SELECT id, workspace_path FROM projects WHERE 1=1")
     out: dict = {}
-    for r in rows:
+    sem = asyncio.Semaphore(4)
+
+    async def _probe_one(r: dict) -> None:
         root = r["workspace_path"]
         if not root:
-            continue
+            return
         if await project_sandbox_mode(r["id"]) == "danger-full-access":
             out[root] = {"danger-full-access": {"ok": None, "skipped": True}}
-            continue
-        out[root] = await run_sentinel_probes(root, r["id"])
-        bad = [
-            e for e, res in out[root].items()
-            if res.get("ok") is False
-        ]
+            return
+        async with sem:
+            res = await run_sentinel_probes(root, r["id"])
+        out[root] = res
+        bad = [e for e, v in res.items() if v.get("ok") is False]
         if bad:
             log.error(
                 "acl_sandbox_sentinel_failed",
                 project_id=r["id"], workspace=root, entries=bad,
             )
+
+    await asyncio.gather(*[_probe_one(r) for r in rows])
     return out
 
 

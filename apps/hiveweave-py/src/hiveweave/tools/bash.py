@@ -1412,6 +1412,49 @@ def detect_untranslated_unix(command: str) -> str | None:
     )
 
 
+# ── 46 轮 #1：封闭集管道尾自动翻译 ─────────────────────────────
+# 打地鼠自查：拒答+给等价写法的「教学」路线三度复现（07 翻译层退役→
+# 45 补 19 动词→46 `git log｜head` 5 小时照抄），证明模型不消费错误文案。
+# 本函数只做**语义无歧义**的 3 种管道尾映射，集合封闭、承诺不再扩：
+#   `| head -N` → `| Select-Object -First N`（行语义；-c 字节语义不翻）
+#   `| tail -N` → `| Select-Object -Last N`
+#   `| wc -l`   → `| Measure-Object -Line`
+# 仅当**前段无其他 unix-only** 时才翻译（翻译了中段照样炸的场景维持
+# gate 拒绝+教学）。改写命令以 `# [auto-translated from: …]` 尾注
+# 保留原文（tool_args 展示/日志可核对），成功回执不另附标注。
+_CLOSED_PIPE_TAIL_RE = re.compile(
+    r"(?P<tail>\|\s*(?:head|tail)(?:\s+-n?\s*|\s+)(?P<n>\d+)\s*"
+    r"|\|\s*wc\s+-l\s*)$"
+)
+
+
+def try_closed_pipe_translation(command: str) -> tuple[str, str] | None:
+    """管道尾 head/tail/wc → Select-Object/Measure-Object 封闭翻译。
+
+    Returns:
+        (改写命令, 原命令)——可安全改写；None——不属封闭集/前段仍有
+        unix-only/无管道尾（维持 gate 拒绝教学）。
+    """
+    stripped = command.rstrip()
+    m = _CLOSED_PIPE_TAIL_RE.search(stripped)
+    if not m:
+        return None
+    tail = m.group("tail").strip()
+    n = (m.group("n") or "").strip()
+    if tail.startswith("| wc"):
+        ps_tail = "| Measure-Object -Line"
+    elif tail.startswith("| head"):
+        ps_tail = f"| Select-Object -First {n}"
+    else:
+        ps_tail = f"| Select-Object -Last {n}"
+    head_part = stripped[: m.start("tail")].rstrip()
+    if not head_part:
+        return None
+    if detect_untranslated_unix(head_part):
+        return None
+    return (head_part + " " + ps_tail, command)
+
+
 def _normalize_for_pwsh(command: str) -> str:
     """[退役 P1-3 B 结构解] bash 惯用法 → pwsh 的词典翻译层。
 
@@ -1684,6 +1727,20 @@ async def execute_bash(
     # unix-only 命令直接给等价写法，而不是让 pwsh 回「不是内部或外部命令」。
     # 对 bash 与 pwsh 两个 dialect **一视同仁**（R3 实测模型在 pwsh 工具里照写
     # `| head`/unix flag —— 短路被当侧门利用）。pwsh 原生命令不命中指纹，放行。
+    # 46 轮 #1：封闭集管道尾自动翻译（拒答式教学三度复现的让步——
+    # 翻译集合封闭承诺见 try_closed_pipe_translation docstring）。
+    # 仅 pwsh 宿主生效（审计 H2）：Linux/Git Bash 下原生命令合法，
+    # 无条件改写会弄坏可直接执行的 bash。
+    translated_pair = None
+    if _pwsh_is_effective_shell():
+        translated_pair = try_closed_pipe_translation(command)
+        if translated_pair is not None:
+            command, _orig_cmd = translated_pair
+            log.info(
+                "bash.dialect_auto_translated",
+                translated_preview=command[:180],
+            )
+
     dialect_err = _pwsh_dialect_gate(command)
     if dialect_err:
         log.info("bash.dialect_gate", command_preview=command[:120])
@@ -1693,6 +1750,10 @@ async def execute_bash(
         return {"success": False, "output": "",
                 "error": dialect_err, "blocked": True,
                 "runner_failed": True, "dialect_failed": True}
+
+    # 尾注在 gate 之后追加（gate 对注释里的原文词条会误抓 head/tail）
+    if translated_pair is not None:
+        command = f"{command}  # [auto-translated from: {_orig_cmd}]"
 
     # 2. Resolve cwd and validate sandbox
     ws = workspace_path or os.getcwd()
@@ -1857,6 +1918,17 @@ async def execute_run_command(
 
     # R3 P0-2：run_command 同样是被方言混血走的后门（attestation 测试步）。
     # 与 bash/pwsh 工具同一 unix-only gate；native 环境（无 pwsh）gate 闭口。
+    # 仅 pwsh 宿主生效（审计 H2，同 execute_bash）。
+    translated_pair_rc = None
+    if _pwsh_is_effective_shell():
+        translated_pair_rc = try_closed_pipe_translation(command)
+        if translated_pair_rc is not None:
+            command, _orig_cmd_rc = translated_pair_rc
+            log.info(
+                "run_command.dialect_auto_translated",
+                translated_preview=command[:180],
+            )
+
     run_dialect_err = _pwsh_dialect_gate(command)
     if run_dialect_err:
         log.info("run_command.dialect_gate", command_preview=command[:120])

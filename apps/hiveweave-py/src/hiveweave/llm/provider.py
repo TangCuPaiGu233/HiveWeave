@@ -949,9 +949,16 @@ class AnthropicHandler(FormatHandler):
                 thinking = delta.get("thinking", "")
                 if thinking:
                     chunks.append({"type": "reasoning", "content": thinking})
-            # signature_delta 是模型协议层的思考段验签元数据,
-            # 应用层无下游用途 (不回传 API, 不做完整性校验) → 丢弃, 不产出 chunk.
-            # 旧实现把它拼成 [sig:xxx] 塞进 thinking 文本, 污染前端展示.
+            elif delta_type == "signature_delta":
+                # 批次 D：Anthropic thinking signature 持久化——附加到
+                # reasoning chunk 元数据供保存（Claude 扩展思考+多轮
+                # tool-use 要求 thinking 块+signature 原样回传验签）。
+                sig = delta.get("signature", "") or delta.get("text", "")
+                if sig:
+                    chunks.append({
+                        "type": "reasoning_signature",
+                        "content": sig,
+                    })
             elif delta_type == "input_json_delta":
                 partial = delta.get("partial_json", "")
                 if partial:

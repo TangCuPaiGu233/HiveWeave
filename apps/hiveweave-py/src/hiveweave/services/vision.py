@@ -297,6 +297,69 @@ def messages_without_images(
     return out
 
 
+# ── 批次 D：请求级图片预算确定性 offload ─────────────────────────
+#: 预算（字节）：全部历史图片 base64 解码后总大小超过此值 → 最老优先淘汰。
+#: 20 MiB 对齐 DSH maxInlineRequestImageBytes 默认（网关请求体积帽）。
+IMAGE_BUDGET_BYTES = 20 * 1024 * 1024
+
+_OFFLOAD_PLACEHOLDER = "[image offloaded: exceeded request image budget]"
+
+
+def offload_old_images(
+    messages: list[dict[str, Any]],
+    budget_bytes: int = IMAGE_BUDGET_BYTES,
+) -> list[dict[str, Any]]:
+    """确定性图片预算 offload：超预算时按最老优先淘汰历史图片。
+
+    只修改返回的副本（不改输入），淘汰图片的 ``images`` 列表替换为
+    占位文本以保持对话结构。最近的消息图片优先保留。确定性：
+    相同输入永远产生相同输出（无随机/时序依赖）。
+    """
+    import copy as _copy
+
+    result = _copy.deepcopy(messages)
+
+    # 收集全部 (msg_idx, img_idx, data_len) 按消息序
+    entries: list[tuple[int, int, int]] = []
+    total = 0
+    for mi, msg in enumerate(result):
+        imgs = msg.get("images")
+        if not isinstance(msg, dict) or not isinstance(imgs, list):
+            continue
+        for ii, img in enumerate(imgs):
+            data = ""
+            if isinstance(img, dict):
+                data = img.get("data") or ""
+            elif isinstance(img, str):
+                data = img
+            if data:
+                entries.append((mi, ii, len(data)))
+                total += len(data)
+
+    if total <= budget_bytes:
+        return result
+
+    # 最老优先淘汰：替换 data 为占位文本
+    for mi, ii, _sz in entries:
+        if total <= budget_bytes:
+            break
+        msg = result[mi]
+        imgs = msg.get("images")
+        if not isinstance(imgs, list) or ii >= len(imgs):
+            continue
+        img = imgs[ii]
+        if isinstance(img, dict):
+            removed_len = len(img.get("data") or "")
+            img["data"] = _OFFLOAD_PLACEHOLDER
+        elif isinstance(img, str):
+            removed_len = len(img)
+            imgs[ii] = _OFFLOAD_PLACEHOLDER
+        else:
+            continue
+        total -= removed_len
+
+    return result
+
 def openai_image_parts(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """OpenAI Chat Completions image_url parts from internal image dicts."""
     parts: list[dict[str, Any]] = []

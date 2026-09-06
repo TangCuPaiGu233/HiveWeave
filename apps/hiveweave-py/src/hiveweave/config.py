@@ -127,6 +127,9 @@ class Settings(BaseSettings):
     # 词典翻译 _normalize_for_pwsh 已退役，unix-only 前置拒绝给 pwsh 等价）；
     # 确需关闭用 env HIVEWEAVE_ACL_SANDBOX=off。
     acl_sandbox: bool = True
+    # 批次 E 三值化：on（强制）/ off（强制关）/ auto（探测决定）。
+    # 仅 acl_sandbox=True 时生效——False 一律 off。默认 auto 与旧行为一致。
+    acl_sandbox_mode: str = "auto"
     # 专用排空线程池大小（§5.4）。
     acl_max_concurrent: int = 32
     # JS 工具链降级开关：confined=受限 / native=白名单命令走 native（显式 fail-open）。

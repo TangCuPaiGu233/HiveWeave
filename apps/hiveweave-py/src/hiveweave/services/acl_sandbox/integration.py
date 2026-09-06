@@ -21,10 +21,24 @@ class PwshUnavailableError(RuntimeError):
 
 
 def acl_sandbox_active() -> bool:
-    """沙箱启用判定：HIVEWEAVE_ACL_SANDBOX=on 且 Windows。"""
+    """沙箱启用判定（批次 E 三值化：on / off / auto）。
+
+    - ``acl_sandbox=False`` → off（旧 bool 直关，向后兼容）
+    - ``acl_sandbox_mode="off"`` → off（新三值覆盖）
+    - ``acl_sandbox_mode="on"`` → 强制开（不问探测）
+    - ``acl_sandbox_mode="auto"``（默认）→ Windows 即开（与旧 bool=True 一致）
+    - 非 Windows → 一律 False。
+    """
     from hiveweave.config import settings
 
-    return bool(settings.acl_sandbox) and sys.platform.startswith("win")
+    if not sys.platform.startswith("win"):
+        return False
+    if not settings.acl_sandbox:
+        return False
+    mode = getattr(settings, "acl_sandbox_mode", "auto") or "auto"
+    if mode == "off":
+        return False
+    return True
 
 
 def _quote_windows_arg(arg: str) -> str:

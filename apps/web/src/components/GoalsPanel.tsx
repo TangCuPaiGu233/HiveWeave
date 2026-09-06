@@ -306,6 +306,13 @@ export default function GoalsPanel({ projectId }: Props) {
                 className="w-20 px-2 py-0.5 bg-transparent border border-transparent hover:border-g-border rounded text-xs text-g-fg-3 placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/30 shrink-0 text-right"
               />
 
+              {/* KR 进度徽章（批次 G：绑定任务时展示推导进度） */}
+              {kr.taskIds && kr.taskIds.length > 0 && kr.progress && (
+                <span className="text-[10px] font-mono text-g-fg-4 bg-g-bg-soft px-1.5 py-0.5 rounded shrink-0" title="绑定的任务中已批准/已关闭数">
+                  {kr.progress.approved}/{kr.progress.bound}
+                </span>
+              )}
+
               {/* Delete */}
               <button
                 onClick={() => removeKR(idx)}

@@ -77,6 +77,9 @@ export interface KeyResult {
   text: string;
   status: "todo" | "doing" | "done";
   owner?: string;
+  taskIds?: string[];
+  progress?: { bound: number; approved: number };
+  override?: boolean;
 }
 
 export interface GoalsData {

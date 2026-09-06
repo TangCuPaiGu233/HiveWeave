@@ -1,7 +1,51 @@
 """Application configuration — environment variables and constants."""
 
+import sys
 from pathlib import Path
 from pydantic_settings import BaseSettings
+
+
+def is_frozen() -> bool:
+    """True when running as a PyInstaller-frozen EXE (打包税 #1 判据)."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def get_data_root() -> Path:
+    """数据根目录统一解析（spec §11 打包税 #1）。
+
+    优先级：
+    1. ``HIVEWEAVE_DATA_ROOT`` env（显式覆盖，测试/多实例用）
+    2. 冻结 EXE：EXE 同级 ``data/``（便携单目录布局，Meta DB/项目库/
+       凭据/悬浮球位置/助理工作区全部落在这一棵树里）
+    3. 脚本模式（源码运行）：沿用现有约定 ``apps/hiveweave-py/data`` ——
+       向后兼容：既有开发机 Meta DB 与测试基线不迁移、不移位。
+
+    返回的目录**不保证已存在**（调用方按需 mkdir）；路径解析为绝对路径。
+    """
+    import os
+
+    explicit = (os.environ.get("HIVEWEAVE_DATA_ROOT") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    if is_frozen():
+        return Path(sys.executable).resolve().parent / "data"
+    # 脚本模式：config.py 位于 apps/hiveweave-py/src/hiveweave/config.py
+    # parents[2] = apps/hiveweave-py/（与 get_meta_db_path 旧口径一致）
+    return (Path(__file__).resolve().parents[2] / "data").resolve()
+
+
+def get_assistant_workspace() -> Path:
+    """平台级助理系统工作区（spec §7）：数据根下 assistant/。
+
+    助理是隐藏系统工作区的 CEO（D6）——工作区不绑定任何用户项目，
+    永远从数据根取路径，禁止写死相对路径。
+    """
+    return get_data_root() / "assistant"
+
+
+def get_ball_position_file() -> Path:
+    """悬浮球位置记忆文件（spec §10 位置记忆）：数据根下 ball_position.json。"""
+    return get_data_root() / "ball_position.json"
 
 
 class Settings(BaseSettings):
@@ -97,14 +141,16 @@ class Settings(BaseSettings):
     }
 
     def get_meta_db_path(self) -> str:
-        """Return resolved Meta DB path."""
+        """Return resolved Meta DB path.
+
+        契约 11: 默认 apps/hiveweave-py/data/hiveweave.db —— 经数据根函数
+        解析（spec §11 打包税 #1：Meta DB 一律经数据根取路径）。脚本模式
+        数据根就是 apps/hiveweave-py/data，路径与旧口径逐字节一致；冻结
+        EXE 模式落到 EXE 同级 data/。
+        """
         if self.meta_db_path:
             return self.meta_db_path
-        # Default: apps/hiveweave-py/data/hiveweave.db
-        # config.py 位于 apps/hiveweave-py/src/hiveweave/config.py
-        # parents[2] = apps/hiveweave-py/
-        app_root = Path(__file__).resolve().parents[2]
-        return str(app_root / "data" / "hiveweave.db")
+        return str(get_data_root() / "hiveweave.db")
 
 
 settings = Settings()

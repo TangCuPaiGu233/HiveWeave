@@ -482,7 +482,13 @@ async def _handle_phoenix_push(
 
 
 async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
-    """处理 chat push — 保存用户消息 + 发送 message_id + 调用 agent.chat。"""
+    """处理 chat push — 经 deliver_user_message 投递（spec §4.1 共用入口）。
+
+    网页端与悬浮球/飞书（P1+）同一条管道：存 chat_messages（metadata.source
+    区分来源）→ 忙则 InboxService 排队 → 闲则 agent.chat()。本函数只负责
+    phoenix 通道的 ack 时序与结果→wire 事件映射；insert（插话）模式因语义
+    特殊保留在通道层。
+    """
     if not topic.startswith("agent:"):
         return
 
@@ -499,16 +505,14 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
         else None
     )
 
-    from hiveweave.services.chat_message import ChatMessageService
     from hiveweave.agents.supervisor import agent_manager
+    from hiveweave.services.chat_message import ChatMessageService
 
     chat_service = ChatMessageService()
-
-    # BUG-036: 如果 agent 正忙，消息进 inbox 排队——agent 闲了自动处理。
-    # 不再拒绝消息，也不留 orphan 消息在 chat_messages。
     agent = agent_manager.get_agent(agent_id)
 
-    async def _save_user_and_ack() -> None:
+    async def _save_and_ack() -> None:
+        """插话（insert）路径专用：落库 + message_id ack（共用入口外）。"""
         try:
             saved = await chat_service.save_message(
                 {
@@ -518,7 +522,7 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
                     "is_streaming": False,
                     "is_read": True,
                     "images": images,
-                    "metadata": {"source": "user"},
+                    "metadata": {"source": "web"},
                 }
             )
             await send_fn(
@@ -528,152 +532,100 @@ async def _handle_chat_push(topic: str, payload: dict, send_fn: Any) -> None:
         except Exception as e:
             log.warning("phoenix_chat_save_failed", agent_id=agent_id, error=str(e))
 
-    async def _reply_off_duty() -> None:
-        from hiveweave.services.off_duty import send_off_duty_auto_reply
-
-        await _save_user_and_ack()
-        try:
-            asst = await send_off_duty_auto_reply(agent_id)
+    # ── 插话模式：agent 忙时把消息注入运行中 turn 的 next-step 窗口。
+    #    与普通投递语义不同（不排队、不落 inbox），保留在通道层。
+    if (
+        agent is not None
+        and agent.status.value == "processing"
+        and payload.get("mode") == "insert"
+    ):
+        await _save_and_ack()
+        import json as _json
+        user_msg = _json.dumps(
+            {"from": "用户", "content": message}, ensure_ascii=False
+        )
+        result = await agent.steer(user_msg)
+        if result.get("steer") or (
+            result.get("ok") and not result.get("queued")
+        ):
             await send_fn(
-                [None, None, topic, "message_id",
-                 {"id": asst["id"], "agentId": agent_id, "role": "assistant",
-                  "content": asst["content"]}]
+                [None, None, topic, "inserted",
+                 {"message": "Interjected into running turn",
+                  "agentId": agent_id}]
             )
-        except Exception as e:
-            log.warning("phoenix_off_duty_reply_failed", agent_id=agent_id, error=str(e))
+        elif result.get("ok"):
+            # 无活跃 turn/窗口未及接纳 → 退化为普通排队，如实告知。
+            await send_fn(
+                [None, None, topic, "queued_message",
+                 {"message": "Agent busy — insert fell back to queue",
+                  "agentId": agent_id}]
+            )
+        else:
             await send_fn(
                 [None, None, topic, "error",
-                 {"message": "Agent is off duty", "agentId": agent_id}]
+                 {"message": "Interject failed", "agentId": agent_id}]
             )
+        return
 
-    if agent is None:
-        from hiveweave.services.off_duty import is_agent_off_duty
+    # ── 普通投递：共用入口（网页 source=web；悬浮球 source=ball 同函数）──
+    from hiveweave.services.user_message import deliver_user_message
 
-        if await is_agent_off_duty(agent_id):
-            await _reply_off_duty()
-            return
+    async def _ack_user_message(saved: dict) -> None:
+        # 时序契约：message_id ack 必须先于流式 delta 到达客户端。
+        await send_fn(
+            [None, None, topic, "message_id",
+             {"id": saved["id"], "agentId": agent_id, "role": "user"}]
+        )
+
+    result = await deliver_user_message(
+        agent_id,
+        message,
+        "web",
+        images=images,
+        on_user_saved=_ack_user_message,
+    )
+    outcome = result.get("outcome")
+
+    if outcome == "not_found":
         await send_fn(
             [None, None, topic, "error",
              {"message": "Agent not running", "agentId": agent_id}]
         )
         return
-
-    if agent.status.value == "processing":
-        # 插话：不排队等整轮结束，直接把消息注入运行中 turn 的 next-step 窗口。
-        if payload.get("mode") == "insert":
-            await _save_user_and_ack()
-            import json as _json
-            user_msg = _json.dumps(
-                {"from": "用户", "content": message}, ensure_ascii=False
-            )
-            result = await agent.steer(user_msg)
-            if result.get("steer") or (
-                result.get("ok") and not result.get("queued")
-            ):
-                await send_fn(
-                    [None, None, topic, "inserted",
-                     {"message": "Interjected into running turn",
-                      "agentId": agent_id}]
-                )
-            elif result.get("ok"):
-                # 无活跃 turn/窗口未及接纳 → 退化为普通排队，如实告知。
-                await send_fn(
-                    [None, None, topic, "queued_message",
-                     {"message": "Agent busy — insert fell back to queue",
-                      "agentId": agent_id}]
-                )
-            else:
-                await send_fn(
-                    [None, None, topic, "error",
-                     {"message": "Interject failed", "agentId": agent_id}]
-                )
-            return
-
-        # Agent busy — queue via inbox. Save to chat so user sees it,
-        # send to inbox so agent picks it up when idle.
-        # Store PLAIN text only: from_agent_id + message_type already identify
-        # the sender. Pre-wrapping {"from","content"} caused trigger digests to
-        # double-encode the body (nested JSON → apparent amnesia).
-        await _save_user_and_ack()
-        # Queue to inbox for processing when agent becomes idle
-        from hiveweave.services.inbox import InboxService
-        await InboxService().send_message(
-            from_agent_id="用户", to_agent_id=agent_id, message=message,
-            message_type="user_message", priority="normal",
-            trusted_platform=True,
-        )
+    if outcome == "queued":
         await send_fn(
             [None, None, topic, "queued_message",
              {"message": "Agent is busy — message queued", "agentId": agent_id}]
         )
         return
-
-    # Agent idle — process immediately
-    try:
-        saved = await chat_service.save_message(
-            {
-                "agent_id": agent_id,
-                "role": "user",
-                "content": message,
-                "is_streaming": False,
-                "images": images,
-                "metadata": {"source": "user"},
-            }
-        )
-        await send_fn(
-            [None, None, topic, "message_id",
-             {"id": saved["id"], "agentId": agent_id, "role": "user"}]
-        )
-    except Exception as e:
-        log.warning("phoenix_chat_save_failed", agent_id=agent_id, error=str(e))
-
-    # 防御性回调补丁
-    if getattr(agent, "_on_stream_event", None) is None:
-        from hiveweave.realtime.event_bus import create_agent_callbacks
-        project_id = getattr(agent, "project_id", "") or ""
-        on_status, on_stream = create_agent_callbacks(agent_id, project_id)
-        agent._on_status_change = on_status
-        agent._on_stream_event = on_stream
-        log.info("phoenix_patch_agent_callbacks", agent_id=agent_id)
-
-    # BUG-036: JSON-structured user message
-    import json as _json
-    user_msg = _json.dumps({"from": "用户", "content": message}, ensure_ascii=False)
-    # 用户发图喂 LLM：data URL → 内部格式，经 opts 穿到本轮 user 消息与
-    # conversation 用户 turn（chat_messages 已存原图供 UI，此处只喂模型）。
-    # 无图路径保持原单参调用，行为逐字不变；busy insert / inbox 排队仍纯文本。
-    from hiveweave.services.vision import parse_user_images
-
-    user_images = parse_user_images(images) if images else []
-    if user_images:
-        result = await agent.chat(user_msg, {"images": user_images})
-    else:
-        result = await agent.chat(user_msg)
-
-    if result.get("error") == "busy":
+    if outcome == "off_duty":
+        asst_id = result.get("assistant_message_id")
+        if asst_id:
+            await send_fn(
+                [None, None, topic, "message_id",
+                 {"id": asst_id, "agentId": agent_id, "role": "assistant",
+                  "content": result.get("assistant_content") or ""}]
+            )
+        else:
+            await send_fn(
+                [None, None, topic, "error",
+                 {"message": "Agent is off duty", "agentId": agent_id}]
+            )
+        return
+    if outcome == "busy":
         await send_fn(
             [None, None, topic, "busy",
              {"message": "Agent is busy", "agentId": agent_id}]
         )
-    elif result.get("error") == "paused":
+        return
+    if outcome == "paused":
         await send_fn(
             [None, None, topic, "error",
              {"message": "System is paused", "agentId": agent_id}]
         )
-    elif result.get("error") == "project_not_started":
-        # User msg already saved; only send assistant off-duty reply
-        from hiveweave.services.off_duty import send_off_duty_auto_reply
+        return
+    # started → 流式事件由 bus 自动推送
 
-        try:
-            asst = await send_off_duty_auto_reply(agent_id)
-            await send_fn(
-                [None, None, topic, "message_id",
-                 {"id": asst["id"], "agentId": agent_id, "role": "assistant",
-                  "content": asst["content"]}]
-            )
-        except Exception as e:
-            log.warning("phoenix_off_duty_reply_failed", agent_id=agent_id, error=str(e))
-    # ok → 流式事件由 bus 自动推送
 
 
 async def _handle_cancel_push(topic: str, send_fn: Any) -> None:

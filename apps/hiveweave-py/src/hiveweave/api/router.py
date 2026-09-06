@@ -36,6 +36,7 @@ from hiveweave.api.timeline import router as timeline_router
 from hiveweave.api.meetings import router as meetings_router
 from hiveweave.api.system import router as system_router
 from hiveweave.api.token_usage import router as token_usage_router
+from hiveweave.api.ball import router as ball_router  # /ball 静态 + /api/ball/*
 
 log = structlog.get_logger(__name__)
 
@@ -63,6 +64,7 @@ _SUB_ROUTERS = [
     meetings_router,  # /api/projects/{project_id}/meetings — 团队开会状态查询
     system_router,  # /api/system/restart-backend | restart-frontend
     token_usage_router,  # /api/projects/{project_id}/token-usage — LLM token 计量
+    ball_router,  # /ball 悬浮球页面静态托管 + /api/ball/*（spec §10 P0）
 ]
 
 

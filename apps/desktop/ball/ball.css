@@ -1,0 +1,191 @@
+/* 悬浮球页面样式（spec §10）。
+   F4 保底视觉：Windows 透明窗口不赌 —— 不透明深色圆角卡片 + 阴影。 */
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.hidden { display: none !important; }
+
+/* ── 球态卡片 ───────────────────────────────────────────── */
+.ball-card {
+  position: relative;
+  width: 60px;
+  height: 60px;
+  margin: 8px;               /* 留阴影余量（窗口 76×76） */
+  border-radius: 50%;
+  background: radial-gradient(circle at 32% 28%, #ffd75e, #f2a71b 58%, #b06f00);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  cursor: grab;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.12s ease;
+}
+.ball-card:hover { transform: scale(1.06); }   /* hover 微放大 */
+.ball-avatar { font-size: 30px; line-height: 1; pointer-events: none; }
+
+.ball-badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 10px;
+  background: #e5484d;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 20px;
+  text-align: center;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+
+/* ── 展开态面板 ─────────────────────────────────────────── */
+.panel-card {
+  position: absolute;
+  inset: 6px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 14px;
+  background: #1e1f24;
+  color: #e8e8ea;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: #26272e;
+  border-bottom: 1px solid #33343c;
+  cursor: grab;
+}
+
+.tabs { display: flex; gap: 6px; flex: 1; overflow-x: auto; }
+.tabs::-webkit-scrollbar { display: none; }
+
+.tab {
+  border: 1px solid #3a3b44;
+  background: #2c2d35;
+  color: #b9bac2;
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.tab.active {
+  background: #f2a71b;
+  border-color: #f2a71b;
+  color: #1e1f24;
+  font-weight: 600;
+}
+.tab .dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 4px;
+  border-radius: 50%;
+  background: #e5484d;
+  vertical-align: middle;
+}
+
+.icon-btn {
+  border: none;
+  background: transparent;
+  color: #b9bac2;
+  font-size: 16px;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  cursor: pointer;
+  flex: none;
+}
+.icon-btn:hover { background: #33343c; color: #fff; }
+
+/* ── 消息流 ─────────────────────────────────────────────── */
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  user-select: text;
+}
+.msg {
+  max-width: 84%;
+  padding: 7px 10px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.msg.user {
+  align-self: flex-end;
+  background: #2f5bd7;
+  color: #fff;
+  border-bottom-right-radius: 3px;
+}
+.msg.assistant {
+  align-self: flex-start;
+  background: #2c2d35;
+  border: 1px solid #3a3b44;
+  border-bottom-left-radius: 3px;
+}
+.msg .meta {
+  display: block;
+  font-size: 10px;
+  opacity: 0.55;
+  margin-top: 3px;
+}
+.empty-tip {
+  align-self: center;
+  color: #6f7078;
+  font-size: 12px;
+  margin-top: 32px;
+}
+
+/* ── 输入区 ─────────────────────────────────────────────── */
+.composer {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border-top: 1px solid #33343c;
+  background: #26272e;
+}
+#input {
+  flex: 1;
+  border: 1px solid #3a3b44;
+  border-radius: 8px;
+  background: #1a1b20;
+  color: #e8e8ea;
+  padding: 7px 10px;
+  font-size: 13px;
+  outline: none;
+}
+#input:focus { border-color: #f2a71b; }
+#btn-send {
+  border: none;
+  border-radius: 8px;
+  background: #f2a71b;
+  color: #1e1f24;
+  font-weight: 600;
+  padding: 0 14px;
+  cursor: pointer;
+}
+#btn-send:hover { background: #ffbe3d; }
+#btn-send:disabled { background: #55565e; color: #9a9ba2; cursor: default; }

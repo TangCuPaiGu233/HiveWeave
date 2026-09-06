@@ -830,6 +830,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("game_time_init_failed", error=str(e))
 
+    # 4.5 平台级助理 seed（spec §7 部署首启自动创建；审计 H1：须在
+    # Bug K 归零之后——ensure 会把助理项目 is_started 拉回 1）
+    try:
+        from hiveweave.services.assistant import (
+            ASSISTANT_AGENT_ID,
+            ensure_agent_started,
+            ensure_assistant,
+        )
+
+        await ensure_assistant()
+        await ensure_agent_started(ASSISTANT_AGENT_ID)
+        log.info("assistant_seeded")
+    except Exception as e:
+        log.warning("assistant_seed_failed", error=str(e))
+
     # 4b. Rebuild agent_router (in-memory agent_id → project_id routing)
     try:
         from hiveweave.services.agent_router import agent_router

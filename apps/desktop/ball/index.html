@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HiveWeave Ball</title>
+  <link rel="stylesheet" href="/ball/ball.css" />
+</head>
+<body class="mode-ball">
+  <!-- ══ 球态（§10：60px 头像 + 未读红点 + 拖/点）══ -->
+  <div id="ball" class="ball-card" data-drag-region title="HiveWeave 助理">
+    <div class="ball-avatar">🐝</div>
+    <div id="ball-badge" class="ball-badge hidden">0</div>
+  </div>
+
+  <!-- ══ 展开态（§10：380px 聊天面板）══ -->
+  <div id="panel" class="panel-card hidden">
+    <div class="panel-header" data-drag-region>
+      <button id="btn-collapse" class="icon-btn" title="收起">−</button>
+      <div id="tabs" class="tabs"><!-- JS 填充：助理 / 项目 CEO --></div>
+      <button id="btn-main" class="icon-btn" title="打开主界面">⌂</button>
+    </div>
+    <div id="messages" class="messages"><!-- JS 填充 --></div>
+    <div class="composer">
+      <input id="input" type="text" placeholder="输入消息…" autocomplete="off" />
+      <button id="btn-send">发送</button>
+    </div>
+  </div>
+
+  <script src="/ball/ball.js"></script>
+</body>
+</html>

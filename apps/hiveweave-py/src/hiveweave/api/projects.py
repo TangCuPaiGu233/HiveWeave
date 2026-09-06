@@ -690,10 +690,15 @@ async def list_projects(status: str | None = Query(default=None)) -> dict:
 
     Meta DB slimming 后只返回 id, name, workspace_path, created_at。
     前端可通过 GET /api/projects/{id} 获取完整详情（含 charter 等）。
+    助理系统工作区（spec §7：固定 project_id）不出现在项目列表。
     """
+    from hiveweave.services.assistant import ASSISTANT_PROJECT_ID
+
     rows = await meta_db.query(
         "SELECT id, name, workspace_path, is_started, additional_read_dirs, "
-        "additional_writable_dirs, sandbox_mode, created_at FROM projects ORDER BY created_at DESC"
+        "additional_writable_dirs, sandbox_mode, created_at FROM projects "
+        "WHERE id != ? ORDER BY created_at DESC",
+        [ASSISTANT_PROJECT_ID],
     )
     active_id = await _get_active_project_id()
     projects = [_project_response(dict(r), active_id) for r in rows]

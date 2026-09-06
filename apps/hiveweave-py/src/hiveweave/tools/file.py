@@ -499,6 +499,30 @@ def _is_binary(abs_path: str) -> bool:
         return False
 
 
+def _reports_evidence_hint(file_path: str, root: str) -> str:
+    """46/11 #4：reports 路径缺失时区分「证据未产生」vs「id 错误」。
+
+    file_path 匹配 ``.hiveweave/reports/<id>/…`` 时，检查 `<id>` 目录是否
+    存在：存在 → 证据目录已有但该文件未生成；不存在 → 该 id 无任何证据。
+    非 reports 路径返回空串。
+    """
+    import re as _re
+    norm = file_path.replace("\\", "/")
+    m = _re.search(r"\.hiveweave/reports/([^/]+)", norm)
+    if not m:
+        return ""
+    eid = m.group(1)
+    # 查找项目根下的 reports/<id>
+    reports_dir = Path(root) / ".hiveweave" / "reports" / eid if root else None
+    if reports_dir and reports_dir.is_dir():
+        entries = [e.name for e in reports_dir.iterdir() if not e.name.startswith(".")]
+        if entries:
+            return (f" [reports/{eid} exists: {', '.join(entries[:5])}"
+                    f"{'…' if len(entries) > 5 else ''} — file not yet generated]")
+        return f" [reports/{eid} exists but is empty — evidence not yet produced]"
+    return f" [no reports directory for id '{eid}' — evidence not yet produced]"
+
+
 def _format_size(size: int) -> str:
     if size < 1024:
         return f"{size}B"
@@ -551,9 +575,11 @@ async def read_file(
 
     p = Path(full)
     if not p.exists():
+        # 46/11 #4：reports 路径区分「证据未产生」vs「id 错误」
+        reports_hint = _reports_evidence_hint(file_path, root or "")
         return {"success": False, "output": "",
                 "error": f"Error: File not found: {file_path}."
-                         f"{READ_MISS_HINT}"}
+                         f"{reports_hint}{READ_MISS_HINT}"}
     if p.is_dir():
         return {"success": False, "output": "",
                 "error": f"Error: Path is a directory, not a file: {file_path}"}

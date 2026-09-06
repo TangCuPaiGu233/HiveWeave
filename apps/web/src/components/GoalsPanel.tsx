@@ -153,6 +153,16 @@ export default function GoalsPanel({ projectId }: Props) {
     setDirty(true);
   };
 
+  const updateTaskIds = (idx: number, raw: string) => {
+    setGoals((g) => {
+      const krs = [...g.keyResults];
+      const ids = raw.split(",").map(s => s.trim()).filter(Boolean);
+      krs[idx] = { ...krs[idx], taskIds: ids.length > 0 ? ids : undefined };
+      return { ...g, keyResults: krs };
+    });
+    setDirty(true);
+  };
+
   if (loading) {
     return (
       <div className="h-full flex items-center justify-center text-g-fg-4 text-sm">
@@ -303,13 +313,21 @@ export default function GoalsPanel({ projectId }: Props) {
                 value={kr.owner || ""}
                 onChange={(e) => updateOwner(idx, e.target.value)}
                 placeholder="负责人"
-                className="w-20 px-2 py-0.5 bg-transparent border border-transparent hover:border-g-border rounded text-xs text-g-fg-3 placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/30 shrink-0 text-right"
+                className="w-16 px-1.5 py-0.5 bg-transparent border border-transparent hover:border-g-border rounded text-xs text-g-fg-3 placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/30 shrink-0 text-right"
               />
 
-              {/* KR 进度徽章（批次 G：绑定任务时展示推导进度） */}
+              {/* Task binding input (批次 G: KR↔任务绑定) */}
+              <input
+                value={kr.taskIds?.join(", ") || ""}
+                onChange={(e) => updateTaskIds(idx, e.target.value)}
+                placeholder="绑任务 ID（逗号分隔）"
+                className="w-32 px-2 py-0.5 bg-g-bg-soft border border-g-border/60 rounded text-[10px] font-mono text-g-fg-3 placeholder-g-fg-4/50 focus:outline-none focus:border-g-blue/40 shrink-0"
+              />
+
+              {/* KR 进度徽章 */}
               {kr.taskIds && kr.taskIds.length > 0 && kr.progress && (
-                <span className="text-[10px] font-mono text-g-fg-4 bg-g-bg-soft px-1.5 py-0.5 rounded shrink-0" title="绑定的任务中已批准/已关闭数">
-                  {kr.progress.approved}/{kr.progress.bound}
+                <span className="text-[10px] font-mono text-g-fg-4 bg-g-bg-soft px-1.5 py-0.5 rounded shrink-0" title={`绑定 ${kr.progress.bound} 个任务，${kr.progress.approved} 个已批准`}>
+                  ✓{kr.progress.approved}/{kr.progress.bound}
                 </span>
               )}
 

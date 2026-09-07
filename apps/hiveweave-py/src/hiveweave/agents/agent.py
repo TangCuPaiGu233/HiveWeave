@@ -1653,6 +1653,12 @@ class Agent:
             messages.append({"role": "user", "content": hint})
             self._pending_resume_hint = None
 
+        # 批次 D：请求级图片预算 offload——历史图片 base64 总量超预算时
+        # 最老优先淘汰（确定性，不改输入；近期图片优先保留）。
+        from hiveweave.services.vision import offload_old_images
+
+        messages = offload_old_images(messages)
+
         return messages
 
     def _get_identity_prompt(self) -> str:
